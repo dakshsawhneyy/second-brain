@@ -35,8 +35,29 @@ ITEM_CAP = 300
 
 # --- redaction -----------------------------------------------------------------------------------
 
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END [A-Z ]{0,30}PRIVATE KEY-----")
+PEM_MAX_CHARS = 8000  # a real key is under 4 KB; this bound keeps every BEGIN's search short
+
+
+def _redact_pem(text: str) -> str:
+    """Replace each BEGIN..END private-key block. The END is searched only within PEM_MAX_CHARS of its BEGIN, so a hostile
+    file of repeated BEGIN lines costs linear time (the old single lazy regex was quadratic and froze the whole process)."""
+    out: list[str] = []
+    pos = 0
+    for begin in _PEM_BEGIN.finditer(text):
+        if begin.start() < pos:
+            continue
+        end = _PEM_END.search(text, begin.end(), min(len(text), begin.end() + PEM_MAX_CHARS))
+        if end:
+            out.append(text[pos:begin.start()])
+            out.append("[REDACTED]")
+            pos = end.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 _SECRET_PATTERNS = [
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
     re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"),                       # Telegram bot token
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),                                # OpenAI / Anthropic style
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"),                           # GitHub tokens
@@ -56,6 +77,7 @@ _REMINDER = re.compile(r"<(system-reminder|task-notification|local-command-cavea
 
 
 def redact_secrets(text: str) -> str:
+    text = _redact_pem(text)
     for pat in _SECRET_PATTERNS:
         text = pat.sub("[REDACTED]", text)
     return _ASSIGNMENT.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)

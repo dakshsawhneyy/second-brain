@@ -21,8 +21,8 @@ from ..retrieval import make_expander
 from ..sessions import redact_secrets
 from ..store import Store
 from . import ledger, onboarding
-from .guards import check
-from .persona import PERSONA
+from .guards import check, strip_note_ids
+from .persona import ASK_MODE, PERSONA
 from .runner import Runner, Vikram
 from .state import MentorState
 
@@ -354,7 +354,7 @@ class Mentor:
         tone = ledger.tone_for(self.store, now, self.phase(now))
 
         def guarded(system: str, prompt: str) -> str:
-            text = self.runner(system, prompt)
+            text = strip_note_ids(self.runner(system, prompt))
             fails = check(text, kind="chat", tone=tone, allowed_ids=set(), allowed_text=prompt, recent=self.state.sent())
             if BLOCKING & set(fails):
                 raise AdviceError("my own rules blocked that answer; ask again in different words")
@@ -366,5 +366,6 @@ class Mentor:
             kwargs = {"daily_limit": daily_limit} if daily_limit else {}
             expand = make_expander(self.local_llm) if self.local_llm is not None else None  # free, only when needed
             return advisor_ask(self.store, question, self.goals_text, now, message_id, runner=guarded, index=self.index,
-                               system=PERSONA, extra="\n".join(facts), profile=self._profile_text(), expand=expand,
+                               system=PERSONA + "\n\n" + ASK_MODE, extra="\n".join(facts),
+                               profile=self._profile_text(), expand=expand,
                                **kwargs)

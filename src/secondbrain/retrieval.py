@@ -29,6 +29,7 @@ class Evidence:
     source: str
     text: str
     score: float
+    title: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ def rrf(rankings: list[list], k: int = RRF_K) -> list:
 
 def retrieve(index, question: str, *, k: int = 8, expand: Callable[[str], list[str]] | None = None,
              weak_below: float = 0.5, exclude: frozenset[str] = frozenset(),
-             sources: frozenset[str] | None = None) -> Retrieval:
+             sources: frozenset[str] | None = None, extra_queries: list[str] | tuple[str, ...] = ()) -> Retrieval:
     """Top `k` evidence paragraphs for `question`. `local-only` notes are never returned."""
 
     def search(query: str):
@@ -59,22 +60,23 @@ def retrieve(index, question: str, *, k: int = 8, expand: Callable[[str], list[s
     base = search(question)
     weak = (base[0].score if base else 0.0) < weak_below
     expansions: list[str] = []
-    ranked = base
     if weak and expand is not None:
         try:
             expansions = [q for q in (expand(question) or []) if q and q.strip()][:3]
         except Exception:  # the local model is optional: fall back to the plain results
             expansions = []
-        if expansions:
-            by_key = {(h.card_id, h.snippet): h for h in base}
-            rankings = [[(h.card_id, h.snippet) for h in base]]
-            for query in expansions:
-                found = search(query)
-                rankings.append([(h.card_id, h.snippet) for h in found])
-                for h in found:
-                    by_key.setdefault((h.card_id, h.snippet), h)
-            ranked = [by_key[key] for key in rrf(rankings)]
-    items = [Evidence(h.card_id, h.date, h.source, h.snippet, h.score) for h in ranked[:k]]
+    others = expansions + [q for q in extra_queries if q and q.strip()]
+    ranked = base
+    if others:
+        by_key = {(h.card_id, h.snippet): h for h in base}
+        rankings = [[(h.card_id, h.snippet) for h in base]]
+        for query in others:
+            found = search(query)
+            rankings.append([(h.card_id, h.snippet) for h in found])
+            for h in found:
+                by_key.setdefault((h.card_id, h.snippet), h)
+        ranked = [by_key[key] for key in rrf(rankings)]
+    items = [Evidence(h.card_id, h.date, h.source, h.snippet, h.score, h.title) for h in ranked[:k]]
     return Retrieval(items=items, weak=weak, expansions=expansions)
 
 

@@ -34,6 +34,7 @@ from ..schema import Topic
 from ..inbox import MAX_TRIES
 from ..sessions import redact_secrets
 from .capture import _PREFIX as _PREFIX_RE, parse_capture
+from .documents import handle_reply as _handle_document_reply, on_document, replay_docreply, replay_document
 from .classify import MIN_CHARS
 from .summary import build_summary
 
@@ -124,7 +125,7 @@ def _markup(brief: Brief) -> InlineKeyboardMarkup | None:
 
 HELP_TEXT = """Second brain online.
 
-Just type or talk. Anything you send (a thought, a journal entry, what you learned from a book, a link, a voice note) is saved automatically. Reply to a mentor message to answer him; send on its own to just log it.
+Just type or talk. Anything you send (a thought, a journal entry, what you learned from a book, a link, a voice note) is saved automatically. Reply to a mentor message to answer him; send on its own to just log it. Send a file (.txt, .md, .pdf, a WhatsApp chat .zip) and I will ask what it is.
 
 Commands, only where the bot must act differently:
 /brief - today's plan
@@ -549,6 +550,13 @@ def _inbox_done(d, mid) -> None:
             log.warning("inbox cleanup failed: %s", type(e).__name__)
 
 
+def _doc_prompt_id(d, message):
+    """The id of the bot's "what is this file?" question this message replies to, or None."""
+    pending, target = d.get("pending_docs"), getattr(message, "reply_to_message", None)
+    prompt_id = getattr(target, "message_id", None)
+    return prompt_id if pending is not None and pending.knows_prompt(prompt_id) else None
+
+
 async def _record_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Runs first for every update: write the message to the durable inbox before anything can fail."""
     d = context.bot_data
@@ -561,10 +569,17 @@ async def _record_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     when = (getattr(message, "date", None) or d["now"]()).isoformat()
     media = getattr(message, "voice", None) or getattr(message, "audio", None)
+    document = getattr(message, "document", None)
+    prompt_id = _doc_prompt_id(d, message)
     try:
-        if media is not None:
+        if document is not None:
+            inbox.add(mid, {"kind": "document", "file_id": document.file_id, "name": document.file_name or "",
+                            "size": document.file_size or 0, "caption": getattr(message, "caption", None) or "", "date": when})
+        elif media is not None:
             inbox.add(mid, {"kind": "voice", "file_id": media.file_id, "dur": int(getattr(media, "duration", 0) or 0),
-                            "date": when, "reply": _reply_context(message)})
+                            "date": when, "reply": _reply_context(message), **({"docprompt": prompt_id} if prompt_id else {})})
+        elif prompt_id is not None and getattr(message, "text", None):
+            inbox.add(mid, {"kind": "docreply", "text": message.text, "prompt_id": prompt_id, "date": when, "reply": None})
         else:
             raw = _capture_raw(getattr(message, "text", "") or "")
             kind = _prompt_kind(message)
@@ -596,6 +611,12 @@ async def _replay_inbox(app: Application) -> None:
                                        "tries. It is still kept on your computer, so nothing is lost.")
             continue
         try:
+            if entry["kind"] == "document":
+                await replay_document(app, mid, entry)
+                continue
+            if entry["kind"] == "docreply" and await replay_docreply(app, entry):
+                inbox.done(mid)  # it answered a file question: handled, and NOT turned into a note
+                continue
             when = datetime.fromisoformat(entry["date"])
             heard = None
             if entry["kind"] == "voice":
@@ -609,6 +630,9 @@ async def _replay_inbox(app: Application) -> None:
                 text = (await asyncio.to_thread(transcriber.transcribe, audio)).strip()
                 if not text:
                     inbox.done(mid)
+                    continue
+                if entry.get("docprompt") is not None and await replay_docreply(app, entry, text):
+                    inbox.done(mid)  # a spoken answer to a file question: finish the document, no note
                     continue
                 raw, heard = text, text
             else:
@@ -703,6 +727,8 @@ async def _handle_voice(update, d, message, media, transcriber, seconds: int, mi
 
 
 async def _process_text(update: Update, d, raw: str, strict_mentor: bool = False) -> None:
+    if await _handle_document_reply(update, d, raw):  # he is answering "what is this file?"
+        return
     kind = _prompt_kind(update.message)
     if kind == "ask":
         await _do_ask(update, d, raw)
@@ -960,6 +986,9 @@ def build_application(
     transcriber=None,
     inbox=None,
     outbox=None,
+    doc_llm=None,
+    pending_docs=None,
+    owner_names=("daksh",),
 ) -> Application:
     if not token:
         raise ValueError("a Telegram bot token is required")
@@ -978,7 +1007,7 @@ def build_application(
     )
     app.bot_data.update(
         token=token, owner_id=owner_id, store=store, goals_text=goals_text, state_path=Path(state_path),
-        focus_projects=focus_projects, classifier=classifier, index=index, mentor=mentor, transcriber=transcriber, inbox=inbox, outbox=outbox,
+        focus_projects=focus_projects, classifier=classifier, index=index, mentor=mentor, transcriber=transcriber, inbox=inbox, outbox=outbox, doc_llm=doc_llm, pending_docs=pending_docs, owner_names=owner_names,
         now=now or (lambda: datetime.now().astimezone()),
     )
 
@@ -996,6 +1025,7 @@ def build_application(
         app.add_handler(CommandHandler(verb, _mark_command(verb), filters=only_owner))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & only_owner, on_text))
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & only_owner, on_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL & only_owner, on_document))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(_on_error)
     return app

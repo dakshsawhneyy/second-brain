@@ -12,6 +12,11 @@ _MARKDOWN = re.compile(r"(\*\*|__|`|^\s{0,3}#{1,6}\s|^\s*[-*•]\s|^\s*\d+[.)]\s
 _IDS = re.compile(r"\[([A-Za-z0-9_-]{2,60})\]")
 _NUMS = re.compile(r"\d{2,}")
 
+_ID = r"(?:tg|mo|cc|adv|adq|dg[dwm]|mc|ck)_(?:\d|[0-9a-f]{6})[\w#-]*"
+_ID_BRACKET = re.compile(rf"\s*\[{_ID}\]")
+_ID_PAREN = re.compile(rf"\s*\((?:from\s+)?{_ID}(?:\s*,\s*{_ID})*\)")
+_ID_BARE = re.compile(rf"\s*\b{_ID}\b")
+
 MAX_WORDS = {"daily": 120, "evening": 170, "onboarding": 120, "letter": 350, "chat": 230}
 
 
@@ -59,3 +64,10 @@ def check(text: str, *, kind: str, tone: str, allowed_ids: set[str], allowed_tex
         if "repetition" not in fails:
             fails.append("repetition")
     return fails
+
+
+def strip_note_ids(text: str) -> str:
+    """Remove internal note ids (like [mo_32] or (tg_12)) from a reply: he reads plain words, never our bookkeeping."""
+    for pattern in (_ID_BRACKET, _ID_PAREN, _ID_BARE):
+        text = pattern.sub("", text)
+    return text

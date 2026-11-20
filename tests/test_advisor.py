@@ -70,3 +70,14 @@ def test_empty_question_and_daily_limit(tmp_path):
 
 def test_prompt_marks_memory_as_data():
     assert "MEMORY" in build_prompt("hi", "ctx")
+
+
+def test_the_default_daily_limit_is_twenty_questions(tmp_path):
+    from secondbrain.advisor import DEFAULT_DAILY_LIMIT
+    assert DEFAULT_DAILY_LIMIT == 20
+    store = Store(tmp_path / "b")
+    for i in range(19):
+        ask(store, f"question {i}", "", NOW, message_id=i + 1, runner=lambda s, p: "answer")   # the 20th is still allowed
+    ask(store, "question 19", "", NOW, message_id=20, runner=lambda s, p: "answer")
+    with pytest.raises(AdviceError, match="Daily limit of 20"):
+        ask(store, "one too many", "", NOW, message_id=21, runner=lambda s, p: "answer")

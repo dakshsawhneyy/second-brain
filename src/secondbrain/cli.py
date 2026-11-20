@@ -454,6 +454,7 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
                           if line.strip() and not line.startswith("#")) or None
 
             classifier = None
+            label_llm = None  # stays None when no local model is configured (documents then use plain fallbacks)
             try:
                 from .bot.classify import classify_text
 
@@ -475,6 +476,7 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
 
             prefer_ipv4()  # his IPv6 route to Telegram fails about half the time; IPv4 does not
             from .inbox import Inbox
+            from .docimport import PendingDocs
             from .outbox import Outbox
             from .speech import WhisperTranscriber
 
@@ -493,7 +495,9 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
                                   index=Index(settings.index_path, _default_embedder(settings)),
                                   mentor=mentor, transcriber=transcriber,
                                   inbox=Inbox(settings.raw_dir / "inbox.json"),
-                                  outbox=Outbox(settings.raw_dir / "outbox.json")).run_polling(bootstrap_retries=-1)  # keep retrying while offline
+                                  outbox=Outbox(settings.raw_dir / "outbox.json"),
+                                  doc_llm=label_llm, pending_docs=PendingDocs(settings.raw_dir),
+                                  owner_names=tuple(n.strip() for n in settings.env.get("SB_OWNER_NAMES", "Daksh").split(",") if n.strip())).run_polling(bootstrap_retries=-1)  # keep retrying while offline
 
             code = run_with_retries(serve, settings.telegram_token)
             if code == 2:

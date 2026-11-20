@@ -21,6 +21,7 @@ from pathlib import Path
 from .schema import Card, KeyPoint, Topic
 from . import usage
 from .sessions import redact_secrets
+from .documents import looks_like_pasted_chat
 from .retrieval import EVIDENCE_RULE, Evidence, coverage_line, format_evidence, retrieve
 from .store import Store
 
@@ -31,23 +32,32 @@ CONTEXT_SOURCES = {"telegram", "advice", "claude-chat", "mentor", "digest"}
 LEDGER_TYPES = {"commitment", "checkin"}  # the ledger reaches Claude through FACTS, not the pack
 KEYWORD_SOURCES = CONTEXT_SOURCES  # session summaries stay local unless he opts in
 RECENT_DAYS = 30
-MAX_RECENT = 5
+MAX_RECENT = 6
 MAX_MATCHES = 5
 MAX_EVIDENCE = 8
-MAX_HISTORY = 2
+MAX_HISTORY = 4
 # Every section has its OWN budget (they add up to under PACK_CHARS), so one long section can never push the evidence
-# out of the pack. Before, one cap on the whole text cut off the end, which silently dropped the matched notes.
+# or the conversation out of the pack.
 GOALS_CHARS = 900
 PROFILE_PACK_CHARS = 2500
-ENTRY_CHARS = 260
-ADVICE_CHARS = 500
-RECENT_BUDGET = 1300
-ADVICE_BUDGET = 1000
+ENTRY_CHARS = 260  # older recent entries
+RECENT_LONG_CHARS = 1000  # the newest entries (last 12 hours) keep far more: a pasted chat is the point of the question
+RECENT_LONG_HOURS = 12
+RECENT_LONG_COUNT = 3
+HISTORY_Q_CHARS = 700
+HISTORY_A_CHARS = 900
+HISTORY_BUDGET = 4000
+RECENT_BUDGET = 3000
 EVIDENCE_BUDGET = 2800
-PACK_CHARS = 9000
+DOC_BUDGET = 2200  # material he shared (other people's words) gets its own section and budget
+MAX_DOC_EVIDENCE = 6
+DOC_TEXT_CHARS = 600
+DOC_FRESH_HOURS = 48  # a document shared in the last two days is always introduced, whatever the question
+DOCUMENT_SOURCE = "document"
+PACK_CHARS = 17000
 QUESTION_CHARS = 3000
 ANSWER_STORE_CHARS = 6000
-DEFAULT_DAILY_LIMIT = 10
+DEFAULT_DAILY_LIMIT = 20
 TIMEOUT_SECONDS = 240
 
 SYSTEM_PROMPT = """You are Daksh's personal mentor and close advisor, talking to him through a private Telegram bot.
@@ -106,57 +116,137 @@ def _keyword_evidence(cards: list[Card], question: str, exclude: set[str]) -> li
             scored.append((overlap, c.consumed_at, c))
     scored.sort(key=lambda r: (r[0], r[1]), reverse=True)
     return [Evidence(c.id, c.consumed_at.astimezone().date().isoformat(), c.source,
-                     " | ".join(k.text for k in c.key_points) or c.title, 0.0) for _, _, c in scored[:MAX_EVIDENCE]]
+                     " | ".join(k.text for k in c.key_points) or c.title, 0.0, c.title) for _, _, c in scored[:MAX_EVIDENCE]]
+
+
+_REFERENTIAL = re.compile(r"\b(previous|earlier|before|above|that|this|it|those|again|now|last|you said|your answer|makes sense)\b",
+                          re.IGNORECASE)
+_DOC_PARENT = re.compile(r"doc_\d+")
+
+
+def _fit_newest(lines: list[str], budget: int) -> list[str]:
+    """Oldest-first lines; keep the NEWEST ones that fit and drop the oldest first (the latest exchange must survive)."""
+    kept, used = [], 0
+    for line in reversed(lines):
+        if used + len(line) + 1 > budget:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return list(reversed(kept))
+
+
+def _exchange(card: Card) -> tuple[str, str]:
+    points = [k.text for k in card.key_points]
+    question = points[0][3:] if points and points[0].startswith("Q: ") else (points[0] if points else card.title)
+    answer = points[1][3:] if len(points) > 1 and points[1].startswith("A: ") else " ".join(points[1:])
+    return question, answer
+
+
+def _is_vague(question: str) -> bool:
+    """A short or referring question ("hope that makes sense now for your previous message") says nothing on its own."""
+    words = len(question.split())
+    return words < 14 or (words < 30 and bool(_REFERENTIAL.search(question)))
+
+
+def _context_queries(question: str, advice: list[Card], recent: list[Card]) -> list[str]:
+    """For a vague question, extra search queries built from what was just said, so the search looks for the topic of the
+    conversation instead of the empty words of the follow-up."""
+    if not _is_vague(question):
+        return []
+    queries: list[str] = []
+    if advice:
+        last_question, last_answer = _exchange(advice[-1])
+        queries += [f"{_flat(last_question, 400)} {question}", f"{_flat(last_answer, 400)} {question}"]
+    if recent:
+        queries.append(f"{_flat(' '.join(k.text for k in recent[0].key_points), 400)} {question}")
+    return queries
+
+
+def _recent_line(card: Card, tz, long: bool) -> str:
+    day = card.consumed_at.astimezone(tz).date().isoformat()
+    body = " | ".join(k.text for k in card.key_points) or card.title
+    label = "pasted conversation, not his own words" if looks_like_pasted_chat(body) else card.type
+    return f"- [{day}] {label}: {_flat(body, RECENT_LONG_CHARS if long else ENTRY_CHARS)}"
 
 
 def build_context(store: Store, question: str, goals_text: str, now: datetime, index=None, profile: str = "",
                   expand=None) -> str:
-    """The MEMORY block: goals, profile, recent conversation, recent journal, and the evidence the search found.
+    """The MEMORY block: goals, profile, the conversation so far, recent notes, and the evidence the search found.
 
-    Bounded, local-only-safe, and each section has its own budget so evidence is never cut off the end.
+    Bounded, local-only-safe, and each section has its own budget so nothing important is cut off the end. The newest
+    exchange and the newest long messages are never the ones to go.
     """
-    cards = [c for c in store.iter_cards()
-             if c.channel != LOCAL_ONLY and c.source in KEYWORD_SOURCES and c.type not in LEDGER_TYPES]
+    all_cards = list(store.iter_cards())
+    cards = [c for c in all_cards if c.channel != LOCAL_ONLY and c.source in KEYWORD_SOURCES and c.type not in LEDGER_TYPES]
+    shared_cards = [c for c in all_cards if c.source == DOCUMENT_SOURCE and c.channel != LOCAL_ONLY]
     tz = now.tzinfo
+    keyword_pool = [c for c in cards if c.source != ADVICE_SOURCE]  # the keyword fallback never quotes old answers either
     advice = sorted((c for c in cards if c.source == ADVICE_SOURCE), key=lambda c: c.consumed_at)[-MAX_HISTORY:]
     cutoff = now - timedelta(days=RECENT_DAYS)
     recent = sorted((c for c in cards if c.source in CONTEXT_SOURCES - {ADVICE_SOURCE, "digest"} and c.consumed_at >= cutoff),
                     key=lambda c: c.consumed_at, reverse=True)[:MAX_RECENT]
     used = {c.id for c in advice} | {c.id for c in recent}
 
-    advice_lines = _fit([f"- [{c.consumed_at.astimezone(tz).date().isoformat()}] "
-                         + _flat(" | ".join(k.text for k in c.key_points), ADVICE_CHARS) for c in advice], ADVICE_BUDGET)
-    recent_lines = _fit([_line(c, tz) for c in recent], RECENT_BUDGET)
-    shown = " ".join(" ".join(recent_lines + advice_lines).lower().split())
+    history_lines = _fit_newest([
+        f"- [{c.consumed_at.astimezone(tz).date().isoformat()}] HE ASKED: {_flat(q, HISTORY_Q_CHARS)} | "
+        f"YOU ANSWERED: {_flat(a, HISTORY_A_CHARS)}" for c in advice for q, a in [_exchange(c)]], HISTORY_BUDGET)
+    recent_lines = _fit([
+        _recent_line(c, tz, long=i < RECENT_LONG_COUNT and now - c.consumed_at <= timedelta(hours=RECENT_LONG_HOURS))
+        for i, c in enumerate(recent)], RECENT_BUDGET)
+    shown = " ".join(" ".join(recent_lines + history_lines).lower().split())
+    extras = _context_queries(question, advice, recent)
 
     evidence: list[Evidence] | None = None
     if index is not None:
         try:
-            evidence = retrieve(index, question, k=MAX_EVIDENCE, expand=expand,
-                                sources=frozenset(CONTEXT_SOURCES)).items
+            evidence = retrieve(index, question, k=MAX_EVIDENCE, expand=expand, extra_queries=extras,
+                                sources=frozenset(CONTEXT_SOURCES) - {ADVICE_SOURCE}).items
         except Exception:
             evidence = None  # index missing or embedder unavailable: use the keyword fallback
     if not evidence:  # no index, an index still being rebuilt, or nothing matched by meaning: try plain keywords
-        evidence = _keyword_evidence(cards, question, used)
+        evidence = _keyword_evidence(keyword_pool, question, used)
     evidence = [e for e in evidence if " ".join(e.text.lower().split())[:60] not in shown]  # already shown above
     evidence_lines = _fit(format_evidence(evidence), EVIDENCE_BUDGET)
     included = evidence[:len(evidence_lines)]
 
+    material: list[Evidence] = []
+    intro: list[str] = []
+    if shared_cards:  # documents he shared: other people's words, kept apart from everything he wrote himself
+        for c in sorted(shared_cards, key=lambda c: c.consumed_at, reverse=True):
+            if _DOC_PARENT.fullmatch(c.id) and now - c.consumed_at <= timedelta(hours=DOC_FRESH_HOURS):
+                facts = " ".join(k.text for k in c.key_points if not k.text.startswith("Shared by him"))
+                intro.append(f"[{c.consumed_at.astimezone(tz).date().isoformat()}] {c.title} (just shared): {_flat(facts, 500)}")
+        if index is not None:
+            try:
+                material = retrieve(index, question, k=MAX_DOC_EVIDENCE, extra_queries=extras,
+                                    sources=frozenset({DOCUMENT_SOURCE})).items
+            except Exception:
+                material = []
+        if not material:
+            material = _keyword_evidence(shared_cards, question, set())[:MAX_DOC_EVIDENCE]
+    intro_text = " ".join(" ".join(intro).lower().split())
+    material_lines = _fit(intro + [f"[{e.date}] {e.title}: {_flat(e.text, DOC_TEXT_CHARS)}" for e in material
+                                   if " ".join(e.text.lower().split())[:60] not in intro_text], DOC_BUDGET)
+
     out = ["GOALS:", _flat(goals_text, GOALS_CHARS) or "(none written)"]
     if profile.strip():
         out += ["", "ABOUT HIM:", _flat(profile, PROFILE_PACK_CHARS)]
-    if advice_lines:
-        out += ["", "EARLIER CONVERSATION (oldest first):"] + advice_lines
+    if history_lines:
+        out += ["", "THE CONVERSATION SO FAR (oldest first; the last exchange is what \"your previous message\" means; "
+                    "this is NOT facts about him):"] + history_lines
     if recent_lines:
         out += ["", "RECENT ENTRIES (newest first):"] + recent_lines
     out += ["", "EVIDENCE FROM HIS NOTES (best matches to the question):"] + (evidence_lines or ["(nothing matched)"])
     out += [coverage_line(included)]
+    if material_lines:
+        out += ["", "MATERIAL HE SHARED (written by other people, NOT by him; learn from it and attribute it to them, never "
+                    "treat it as his own views):"] + material_lines
     return redact_secrets("\n".join(out))[:PACK_CHARS]
 
 
 def build_prompt(question: str, context: str, extra: str = "") -> str:
     facts = f"FACTS (his commitments and patterns; you may cite the ids):\n{extra}\n\n" if extra.strip() else ""
-    return (f"MEMORY (data about him, from his own private notes):\n{context}\n\n{facts}"
+    return (f"MEMORY (data about him from his own notes, except the section MATERIAL HE SHARED, which other people wrote):\n{context}\n\n{facts}"
             f"{EVIDENCE_RULE}\n\nHIS QUESTION:\n{redact_secrets(question)[:QUESTION_CHARS]}")
 
 

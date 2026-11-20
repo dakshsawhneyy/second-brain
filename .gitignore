@@ -1,0 +1,14 @@
+.env
+.venv/
+raw/
+index/
+__pycache__/
+*.pyc
+.pytest_cache/
+.superpowers/
+*.tmp
+cards/
+archive/
+profile/
+backups/
+*.egg-info/

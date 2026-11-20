@@ -1,0 +1,540 @@
+{
+  "$defs": {
+    "Action": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "status": {
+          "default": "open",
+          "enum": [
+            "open",
+            "done",
+            "later",
+            "skipped"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "Action",
+      "type": "object"
+    },
+    "KeyPoint": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "topic": {
+          "title": "Topic",
+          "type": "string"
+        },
+        "t": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "T"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "text",
+        "topic",
+        "confidence"
+      ],
+      "title": "KeyPoint",
+      "type": "object"
+    },
+    "MentorMeta": {
+      "additionalProperties": false,
+      "description": "Extra fields of a mentor `commitment` / `checkin` card (additive: old cards stay valid).",
+      "properties": {
+        "day": {
+          "format": "date",
+          "title": "Day",
+          "type": "string"
+        },
+        "item": {
+          "anyOf": [
+            {
+              "maximum": 3,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Item"
+        },
+        "status": {
+          "default": "open",
+          "enum": [
+            "open",
+            "kept",
+            "missed",
+            "dropped"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "enum": [
+                "claimed",
+                "corroborated",
+                "verified"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evidence"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 10,
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "bet": {
+          "default": "other",
+          "enum": [
+            "job",
+            "product",
+            "other"
+          ],
+          "title": "Bet",
+          "type": "string"
+        },
+        "when": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "When"
+        },
+        "first_action": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "First Action"
+        },
+        "miss_category": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miss Category"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "vague": {
+          "default": false,
+          "title": "Vague",
+          "type": "boolean"
+        },
+        "late": {
+          "default": false,
+          "title": "Late",
+          "type": "boolean"
+        },
+        "auto_closed": {
+          "default": false,
+          "title": "Auto Closed",
+          "type": "boolean"
+        },
+        "carried_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Carried From"
+        }
+      },
+      "required": [
+        "day"
+      ],
+      "title": "MentorMeta",
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "transcript": {
+          "default": "n/a",
+          "enum": [
+            "captions",
+            "whisper",
+            "none",
+            "n/a"
+          ],
+          "title": "Transcript",
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "processed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Processed At"
+        }
+      },
+      "title": "Provenance",
+      "type": "object"
+    },
+    "Relevance": {
+      "additionalProperties": false,
+      "properties": {
+        "bet_job": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Bet Job",
+          "type": "integer"
+        },
+        "bet_product": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Bet Product",
+          "type": "integer"
+        },
+        "actionability": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Actionability",
+          "type": "integer"
+        },
+        "novelty": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Novelty",
+          "type": "integer"
+        },
+        "quality": {
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Quality",
+          "type": "integer"
+        },
+        "score": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Score",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bet_job",
+        "bet_product",
+        "actionability",
+        "novelty",
+        "quality",
+        "score"
+      ],
+      "title": "Relevance",
+      "type": "object"
+    },
+    "Topic": {
+      "additionalProperties": false,
+      "properties": {
+        "primary": {
+          "title": "Primary",
+          "type": "string"
+        },
+        "secondary": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 2,
+          "title": "Secondary",
+          "type": "array"
+        }
+      },
+      "required": [
+        "primary"
+      ],
+      "title": "Topic",
+      "type": "object"
+    },
+    "UserSignals": {
+      "additionalProperties": false,
+      "properties": {
+        "rating": {
+          "anyOf": [
+            {
+              "maximum": 5,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rating"
+        },
+        "acted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Acted"
+        }
+      },
+      "title": "UserSignals",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "card.v1",
+      "default": "card.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "source": {
+      "title": "Source",
+      "type": "string"
+    },
+    "type": {
+      "enum": [
+        "consumed",
+        "thought",
+        "decided",
+        "acted",
+        "produced",
+        "experiment",
+        "friction",
+        "book",
+        "link",
+        "commitment",
+        "checkin"
+      ],
+      "title": "Type",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Url"
+    },
+    "channel": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Channel"
+    },
+    "consumed_at": {
+      "format": "date-time",
+      "title": "Consumed At",
+      "type": "string"
+    },
+    "topic": {
+      "$ref": "#/$defs/Topic"
+    },
+    "format": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Format"
+    },
+    "relevance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Relevance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "key_points": {
+      "items": {
+        "$ref": "#/$defs/KeyPoint"
+      },
+      "title": "Key Points",
+      "type": "array"
+    },
+    "action": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Action"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "visibility": {
+      "default": "private",
+      "enum": [
+        "private",
+        "publishable"
+      ],
+      "title": "Visibility",
+      "type": "string"
+    },
+    "tier": {
+      "default": "hot",
+      "enum": [
+        "hot",
+        "warm",
+        "cold"
+      ],
+      "title": "Tier",
+      "type": "string"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "user": {
+      "$ref": "#/$defs/UserSignals"
+    },
+    "mentor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MentorMeta"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "reply_to": {
+      "anyOf": [
+        {
+          "maxLength": 400,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reply To"
+    }
+  },
+  "required": [
+    "id",
+    "source",
+    "type",
+    "title",
+    "consumed_at",
+    "topic"
+  ],
+  "title": "Card",
+  "type": "object"
+}

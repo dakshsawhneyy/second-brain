@@ -1,0 +1,50 @@
+[
+  {
+    "header": "YouTube",
+    "title": "Watched Kubernetes Networking Explained",
+    "titleUrl": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+    "subtitles": [{"name": "Cloud Channel", "url": "https://www.youtube.com/channel/UC1"}],
+    "time": "2026-11-16T10:00:00.000Z",
+    "products": ["YouTube"],
+    "activityControls": ["YouTube watch history"]
+  },
+  {
+    "header": "YouTube",
+    "title": "Watched Kubernetes Networking Explained",
+    "titleUrl": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+    "subtitles": [{"name": "Cloud Channel", "url": "https://www.youtube.com/channel/UC1"}],
+    "time": "2026-11-17T08:30:00.000Z",
+    "products": ["YouTube"],
+    "activityControls": ["YouTube watch history"]
+  },
+  {
+    "header": "YouTube",
+    "title": "Watched a video that has been removed",
+    "time": "2026-11-17T07:00:00.000Z",
+    "products": ["YouTube"]
+  },
+  {
+    "header": "YouTube",
+    "title": "Watched Some Sponsored Ad",
+    "titleUrl": "https://www.youtube.com/watch?v=adadadadad1",
+    "subtitles": [{"name": "Advertiser"}],
+    "details": [{"name": "From Google Ads"}],
+    "time": "2026-11-17T06:00:00.000Z",
+    "products": ["YouTube"]
+  },
+  {
+    "header": "YouTube",
+    "title": "Viewed Channel community post",
+    "titleUrl": "https://www.youtube.com/post/Ugkx123",
+    "time": "2026-11-17T05:00:00.000Z",
+    "products": ["YouTube"]
+  },
+  {
+    "header": "YouTube",
+    "title": "Watched क्लाउड का परिचय 🚀 | DevOps हिंदी",
+    "titleUrl": "https://www.youtube.com/watch?v=bbbbbbbbbbb&list=PL123",
+    "subtitles": [{"name": "हिंदी टेक"}],
+    "time": "2026-11-15T12:00:00Z",
+    "products": ["YouTube"]
+  }
+]

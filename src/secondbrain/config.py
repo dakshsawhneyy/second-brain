@@ -17,6 +17,9 @@ class Settings:
     index_path: Path
     profile_path: Path
     goals_path: Path
+    evals_path: Path
+    living_profile_path: Path
+    onboarding_profile_path: Path
     owner_telegram_id: int | None
     telegram_token: str | None = field(repr=False)  # secret: never shown in repr/tracebacks
     env: Mapping[str, str] = field(default_factory=dict, repr=False)  # may hold secrets: hidden from repr
@@ -54,6 +57,9 @@ def load_settings(root: Path | None = None, env: Mapping[str, str] | None = None
         index_path=root / "index" / "brain.db",
         profile_path=root / "profile" / "profile.md",
         goals_path=root / "profile" / "goals.md",
+        evals_path=root / "profile" / "evals" / "questions.json",  # his data folder: never in the code repo
+        living_profile_path=root / "profile" / "living.md",
+        onboarding_profile_path=root / "profile" / "onboarding.md",
         owner_telegram_id=int(owner_raw) if owner_raw.isdigit() else None,
         telegram_token=env.get("SB_TELEGRAM_TOKEN") or None,
         env=dict(env),

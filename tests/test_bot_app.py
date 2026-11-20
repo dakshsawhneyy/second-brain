@@ -507,7 +507,7 @@ def test_new_idea_gets_related_older_notes_and_stays_quiet_when_nothing_matches(
         def __init__(self, hits):
             self.hits, self.calls = hits, []
 
-        def related(self, text, k, min_cosine, exclude):
+        def related(self, text, k, min_cosine, exclude, **kw):
             self.calls.append((text, exclude))
             return self.hits
 
@@ -517,7 +517,7 @@ def test_new_idea_gets_related_older_notes_and_stays_quiet_when_nothing_matches(
     u = make_update(text="I want to build a habit tracker for interviews", message_id=96)
     run(on_text(u, ctx))
     assert u.message.replies[0][0] == "Saved: thought"
-    assert "written about this before" in u.message.replies[1][0] and "Habit tracker idea" in u.message.replies[1][0]
+    assert "close to this before" in u.message.replies[1][0] and "track daily habits" in u.message.replies[1][0]
     assert ctx.bot_data["index"].calls[0][1] == frozenset({"tg_96"})  # never suggests the note itself
 
     ctx.bot_data["index"] = FakeIndex([])

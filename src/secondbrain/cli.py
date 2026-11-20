@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -174,6 +175,79 @@ def run_index_command(settings: Settings, embedder: Embedder, out: Callable[[str
     return 0
 
 
+def run_eval_command(settings: Settings, embedder: Embedder, out: Callable[[str], None] = print) -> int:
+    """Does the search put the right note in the top results? Local only, uses no Claude quota."""
+    from .advisor import CONTEXT_SOURCES
+    from .evals import load_questions, run_eval
+
+    try:
+        questions = load_questions(settings.evals_path)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if not questions:
+        out(f"no eval questions yet ({settings.evals_path}). Draft some with: sb eval --suggest 25")
+        return 0
+    index = Index(settings.index_path, embedder)
+    result = run_eval(questions, lambda q, k: [h.card_id for h in index.search(q, k=k, per_source_cap=k,
+                                                                                sources=CONTEXT_SOURCES)])  # as /ask sees it
+    out(f"questions: {len(questions)}   recall@5: {result.recall_at_5:.2f}   recall@10: {result.recall_at_10:.2f}   "
+        f"MRR: {result.mrr:.2f}")
+    out("misses: " + (", ".join(result.misses) if result.misses else "none"))
+    return 0
+
+
+def run_eval_suggest_command(settings: Settings, llm, n: int, out: Callable[[str], None] = print) -> int:
+    """Draft eval questions from his notes with the local model and merge them into the questions file."""
+    from .evals import load_questions, suggest_questions
+
+    try:
+        existing = load_questions(settings.evals_path)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    taken = {q.id for q in existing}
+    fresh = [q for q in suggest_questions(Store(settings.root), llm, n) if q.id not in taken]
+    merged = existing + fresh
+    settings.evals_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = settings.evals_path.with_name(settings.evals_path.name + ".tmp")
+    tmp.write_text(json.dumps([q.model_dump() for q in merged], indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, settings.evals_path)
+    out(f"added {len(fresh)} draft questions to {settings.evals_path} ({len(merged)} in total)")
+    out("These are a smoke test only: a local model wrote them from your own notes. Edit them, and add about five "
+        "of your own later for a real measure.")
+    return 0
+
+
+def _local_model(router: Router):
+    """The local model for private work, or None when none is configured (private notes never go to a cloud model)."""
+    try:
+        return router.route("triage", "private")
+    except (ConfigError, SensitivityError, KeyError):
+        return None
+
+
+def _update_profile(settings: Settings, llm, now: datetime) -> bool:
+    from .digest import update_living_profile
+
+    return update_living_profile(Store(settings.root), _read_text(settings.goals_path), llm, now, settings.profile_path,
+                                 settings.onboarding_profile_path, settings.living_profile_path)
+
+
+def run_digest_command(settings: Settings, llm, now: datetime, out: Callable[[str], None] = print,
+                       max_calls: int = 20, force_profile: bool = False) -> int:
+    """Create or update the day/week/month digests (local model), and the living profile when due or forced."""
+    from .digest import living_profile_due, refresh_digests
+
+    store = Store(settings.root)
+    run = refresh_digests(store, llm, now, max_calls=max_calls)
+    out(f"digests: created {len(run.created)}, up to date {run.skipped}, failed {run.failed}")
+    living_on = settings.env.get("SB_LIVING_PROFILE", "off").strip().lower() == "on"
+    if force_profile or (living_on and living_profile_due(store, settings.living_profile_path, now)):
+        out("profile: " + ("updated" if _update_profile(settings, llm, now) else "not updated (kept the previous one)"))
+    return 0
+
+
 def run_backup_command(settings: Settings, now: datetime, out: Callable[[str], None] = print) -> int:
     from .backup import BackupError, make_backup
 
@@ -214,6 +288,24 @@ def run_sync_command(settings: Settings, router: Router, projects_dir: Path, lim
         except Exception as e:  # a broken index must not stop the backup or hide in the log
             lines.append(f"index: failed ({type(e).__name__})")
             codes.append(1)
+    llm = _local_model(router)
+    if llm is None:
+        lines.append("digests: skipped (no local model)")
+    else:
+        try:  # a failing digest step must never fail the sync or hide in the log
+            from .digest import living_profile_due, refresh_digests
+
+            sync_store = Store(settings.root)
+            run = refresh_digests(sync_store, llm, now(), max_calls=6)
+            lines.append(f"digests: +{len(run.created)}" + (f" failed={run.failed}" if run.failed else ""))
+            if settings.env.get("SB_LIVING_PROFILE", "off").strip().lower() != "on":
+                lines.append("profile: off")  # it replaces the profile Claude reads: only when he switches it on
+            elif living_profile_due(sync_store, settings.living_profile_path, now()):
+                lines.append("profile: " + ("ok" if _update_profile(settings, llm, now()) else "failed"))
+            else:
+                lines.append("profile: skipped")
+        except Exception as e:
+            lines.append(f"digests: failed ({type(e).__name__})")
     dest = Path(settings.env.get("SB_BACKUP_DIR", "").strip() or settings.root / "backups")
     passphrase = settings.env.get("SB_BACKUP_PASSPHRASE", "").strip()
     data_repo = settings.env.get("SB_DATA_REPO", "").strip()
@@ -273,6 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
     us = sub.add_parser("usage", help="Claude and local model calls per section, from raw/usage.jsonl")
     us.add_argument("--days", type=int, default=7)
 
+    ev = sub.add_parser("eval", help="check that search finds the right notes (recall, MRR); no Claude quota")
+    ev.add_argument("--suggest", type=int, default=None, metavar="N", help="draft N questions from your notes first")
+
+    dg = sub.add_parser("digest", help="build day/week/month digests of your notes with the local model")
+    dg.add_argument("--profile", action="store_true", help="also rewrite the living profile now")
+
     sub.add_parser("index", help="update the search index with new and changed cards")
     sub.add_parser("backup", help="write an encrypted backup of cards/archive/profile (needs SB_BACKUP_PASSPHRASE)")
     rs = sub.add_parser("restore", help="decrypt a backup into an empty folder")
@@ -319,6 +417,18 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
         if args.command == "sync":
             return run_sync_command(settings, build_router(settings.env), args.projects_dir or default_projects_dir(),
                                     args.limit, embedder=_default_embedder(settings))
+        if args.command == "eval":
+            if args.suggest:
+                code = run_eval_suggest_command(settings, build_router(settings.env).route("triage", "private"), args.suggest)
+                if code != 0:
+                    return code
+            return run_eval_command(settings, _default_embedder(settings))
+        if args.command == "digest":
+            llm = _local_model(build_router(settings.env))
+            if llm is None:
+                print("error: no local model configured (set SB_OLLAMA_MODEL in .env)", file=sys.stderr)
+                return 2
+            return run_digest_command(settings, llm, datetime.now().astimezone(), force_profile=args.profile)
         if args.command == "index":
             return run_index_command(settings, _default_embedder(settings))
         if args.command == "backup":

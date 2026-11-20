@@ -17,6 +17,7 @@ from .. import usage
 from ..advisor import AdviceError, ask as advisor_ask
 from ..llm import Provider, complete_json
 from ..schema import Card, KeyPoint, MentorMeta, Topic
+from ..retrieval import make_expander
 from ..sessions import redact_secrets
 from ..store import Store
 from . import ledger, onboarding
@@ -80,7 +81,13 @@ class Mentor:
         return self.profile_path.with_name("onboarding.md") if self.profile_path else None
 
     def _profile_text(self) -> str:
-        """His hand-written profile.md (background, skills) followed by the generated onboarding profile."""
+        """The living profile once it exists; before that his hand-written profile.md followed by the onboarding profile."""
+        living = self.profile_path.with_name("living.md") if self.profile_path else None
+        try:
+            if living is not None and living.is_file() and living.read_text(encoding="utf-8").strip():
+                return living.read_text(encoding="utf-8").strip()[:3000]
+        except OSError:
+            pass
         parts: list[str] = []
         for path, limit in ((self.profile_path, 1200), (self._onboarding_path(), 3000)):
             try:
@@ -357,5 +364,7 @@ class Mentor:
         self.state.add_turn("d", question)
         with usage.section("ask"):
             kwargs = {"daily_limit": daily_limit} if daily_limit else {}
+            expand = make_expander(self.local_llm) if self.local_llm is not None else None  # free, only when needed
             return advisor_ask(self.store, question, self.goals_text, now, message_id, runner=guarded, index=self.index,
-                               system=PERSONA, extra="\n".join(facts), profile=self._profile_text(), **kwargs)
+                               system=PERSONA, extra="\n".join(facts), profile=self._profile_text(), expand=expand,
+                               **kwargs)

@@ -142,6 +142,7 @@ class Card(_Strict):
     user: UserSignals = Field(default_factory=UserSignals)
     mentor: MentorMeta | None = None
     reply_to: str | None = Field(default=None, max_length=400)  # the message this one was a reply to
+    derived_from: list[str] = Field(default_factory=list, max_length=200)  # ids of the cards a digest was built from
 
     @model_validator(mode="after")
     def _mentor_cards_stay_private(self):

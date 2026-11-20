@@ -10,6 +10,7 @@ import re
 import time as time_module
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, time, timedelta
+from functools import partial
 from pathlib import Path
 
 from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -174,6 +175,27 @@ def _body(message, context) -> str:
 
 RELATED_TYPES = ("thought", "friction", "experiment", "book", "decided")
 RELATED_MIN_CHARS = 25
+RELATED_MIN_COSINE = 0.72  # long personal notes all resemble each other: only a close match in meaning is worth a reply
+RELATED_SOURCES = frozenset({"telegram", "mentor", "claude-chat"})  # his own words, never Claude's advice
+_ECHO_CHARS = 60
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _is_echo(snippet: str, new_text: str) -> bool:
+    """True when a hit is just the new note again (or a repeat of it saved earlier)."""
+    a, b = _squash(snippet), _squash(new_text)
+    return bool(a) and bool(b) and (a[:_ECHO_CHARS] == b[:_ECHO_CHARS] or a.startswith(b[:_ECHO_CHARS]) or b.startswith(a[:_ECHO_CHARS]))
+
+
+def _short_date(iso: str) -> str:
+    try:
+        day = datetime.fromisoformat(iso)
+    except ValueError:
+        return ""
+    return f"{day.day} {day:%b}"
 
 
 async def _suggest_related(update: Update, d, card) -> None:
@@ -183,21 +205,29 @@ async def _suggest_related(update: Update, d, card) -> None:
         return
     if card.type == "thought" and card.action:  # a todo, not an idea
         return
+    if card.reply_to:  # he is answering something, not starting a new thought
+        return
     text = " ".join(k.text for k in card.key_points)
     if len(text.strip()) < RELATED_MIN_CHARS:
         return
     try:
-        hits = await asyncio.to_thread(index.related, text[:2000], 3, 0.55, frozenset({card.id}))
+        today = d["now"]().astimezone().date().isoformat()
+        hits = await asyncio.to_thread(partial(index.related, text[:2000], 3, RELATED_MIN_COSINE, frozenset({card.id}),
+                                               before=today, sources=RELATED_SOURCES))
     except Exception as e:  # the note is already saved; a failed lookup must never show as an error
         log.warning("related-notes lookup failed: %s", type(e).__name__)
         return
-    if not hits:
-        return
-    lines = ["You have written about this before:"]
+    lines = []
+    shown: set[str] = set()
     for h in hits:
-        snippet = " ".join(h.snippet.split())[:140]
-        lines.append(f"- {h.title[:80]}" + (f": {snippet}" if snippet and snippet != h.title[:len(snippet)] else ""))
-    await update.message.reply_text("\n".join(lines))
+        snippet = " ".join(h.snippet.split())
+        if not snippet or _is_echo(snippet, text) or _squash(snippet) in shown:  # echo of the new note, or a twin card
+            continue
+        shown.add(_squash(snippet))
+        when = _short_date(h.date)
+        lines.append(f"- {when + ': ' if when else ''}{snippet[:140]}{'...' if len(snippet) > 140 else ''}")
+    if lines:
+        await update.message.reply_text("You wrote something close to this before:\n" + "\n".join(lines))
 
 
 def _reply_context(message) -> str | None:
@@ -261,6 +291,24 @@ async def _acknowledge_quietly(message) -> None:
         log.warning("could not react: %s", type(e).__name__)
 
 
+def _index_soon(d, card) -> None:
+    """Index a just-saved note in the background so it is searchable right away (not only after the next sync)."""
+    index = d.get("index")
+    if index is None:
+        return
+
+    async def run() -> None:
+        try:
+            await asyncio.to_thread(index.add_card, card)
+        except Exception as e:  # the note is already saved; the next sync will index it
+            log.warning("could not index %s now: %s", card.id, type(e).__name__)
+
+    task = asyncio.create_task(run())
+    tasks = d.setdefault("tasks", set())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
 async def _save_capture(update: Update, d, raw: str, quiet: bool = False):
     message = update.message
     when = getattr(message, "date", None) or d["now"]()  # the message's own send time, not processing time
@@ -271,6 +319,7 @@ async def _save_capture(update: Update, d, raw: str, quiet: bool = False):
         await message.reply_text("I couldn't save that: there was no text after the command.")
         return None
     d["store"].write_card(card)
+    _index_soon(d, card)
     if quiet:
         await _acknowledge_quietly(message)
         return card

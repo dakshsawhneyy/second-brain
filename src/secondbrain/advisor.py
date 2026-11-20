@@ -21,21 +21,30 @@ from pathlib import Path
 from .schema import Card, KeyPoint, Topic
 from . import usage
 from .sessions import redact_secrets
+from .retrieval import EVIDENCE_RULE, Evidence, coverage_line, format_evidence, retrieve
 from .store import Store
 
 LOCAL_ONLY = "local-only"          # card.channel marker: never sent to any non-local model
 ADVICE_SOURCE = "advice"
 ADVICE_MODEL = "claude-sonnet-5-5"
-CONTEXT_SOURCES = {"telegram", "advice", "claude-chat", "mentor"}
+CONTEXT_SOURCES = {"telegram", "advice", "claude-chat", "mentor", "digest"}
 LEDGER_TYPES = {"commitment", "checkin"}  # the ledger reaches Claude through FACTS, not the pack
 KEYWORD_SOURCES = CONTEXT_SOURCES  # session summaries stay local unless he opts in
 RECENT_DAYS = 30
-MAX_RECENT = 8
+MAX_RECENT = 5
 MAX_MATCHES = 5
-MAX_HISTORY = 3
-GOALS_CHARS = 1500
-ENTRY_CHARS = 450
-PACK_CHARS = 7000
+MAX_EVIDENCE = 8
+MAX_HISTORY = 2
+# Every section has its OWN budget (they add up to under PACK_CHARS), so one long section can never push the evidence
+# out of the pack. Before, one cap on the whole text cut off the end, which silently dropped the matched notes.
+GOALS_CHARS = 900
+PROFILE_PACK_CHARS = 2500
+ENTRY_CHARS = 260
+ADVICE_CHARS = 500
+RECENT_BUDGET = 1300
+ADVICE_BUDGET = 1000
+EVIDENCE_BUDGET = 2800
+PACK_CHARS = 9000
 QUESTION_CHARS = 3000
 ANSWER_STORE_CHARS = 6000
 DEFAULT_DAILY_LIMIT = 10
@@ -76,72 +85,79 @@ def _words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]{4,}", text.lower())}
 
 
-def _index_matches(store: Store, index, question: str, exclude: set[str]) -> list[Card]:
-    """Meaning + keyword search over everything he has written. Local-only and non-journal cards are filtered out."""
-    try:
-        hits = index.search(question, k=MAX_MATCHES * 4, per_source_cap=MAX_MATCHES * 4)
-    except Exception:
-        return []  # index missing or embedder unavailable: the keyword fallback below still works
-    found: list[Card] = []
-    for hit in hits:
-        if hit.card_id in exclude:
-            continue
-        try:
-            card = store.read_card(hit.card_id)
-        except KeyError:
-            continue
-        if card.channel == LOCAL_ONLY or card.source not in CONTEXT_SOURCES:
-            continue
-        found.append(card)
-        if len(found) >= MAX_MATCHES:
+def _fit(lines: list[str], budget: int) -> list[str]:
+    """Keep whole lines, in order, while they fit the budget."""
+    out, used = [], 0
+    for line in lines:
+        if used + len(line) + 1 > budget:
             break
-    return found
+        out.append(line)
+        used += len(line) + 1
+    return out
 
 
-def build_context(store: Store, question: str, goals_text: str, now: datetime, index=None, profile: str = "") -> str:
-    """The MEMORY block: goals, recent conversation, recent journal, keyword matches. Bounded and local-only-safe."""
+def _keyword_evidence(cards: list[Card], question: str, exclude: set[str]) -> list[Evidence]:
+    """Fallback when there is no usable index: notes that share words with the question."""
+    q = _words(question)
+    scored = []
+    for c in cards:
+        overlap = len(q & _words(_card_text(c))) if q and c.id not in exclude else 0
+        if overlap:
+            scored.append((overlap, c.consumed_at, c))
+    scored.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    return [Evidence(c.id, c.consumed_at.astimezone().date().isoformat(), c.source,
+                     " | ".join(k.text for k in c.key_points) or c.title, 0.0) for _, _, c in scored[:MAX_EVIDENCE]]
+
+
+def build_context(store: Store, question: str, goals_text: str, now: datetime, index=None, profile: str = "",
+                  expand=None) -> str:
+    """The MEMORY block: goals, profile, recent conversation, recent journal, and the evidence the search found.
+
+    Bounded, local-only-safe, and each section has its own budget so evidence is never cut off the end.
+    """
     cards = [c for c in store.iter_cards()
              if c.channel != LOCAL_ONLY and c.source in KEYWORD_SOURCES and c.type not in LEDGER_TYPES]
     tz = now.tzinfo
     advice = sorted((c for c in cards if c.source == ADVICE_SOURCE), key=lambda c: c.consumed_at)[-MAX_HISTORY:]
     cutoff = now - timedelta(days=RECENT_DAYS)
-    recent = sorted((c for c in cards if c.source in CONTEXT_SOURCES - {ADVICE_SOURCE} and c.consumed_at >= cutoff),
+    recent = sorted((c for c in cards if c.source in CONTEXT_SOURCES - {ADVICE_SOURCE, "digest"} and c.consumed_at >= cutoff),
                     key=lambda c: c.consumed_at, reverse=True)[:MAX_RECENT]
     used = {c.id for c in advice} | {c.id for c in recent}
-    q = _words(question)
-    scored = []
-    for c in cards:
-        if c.id in used or not q:
-            continue
-        overlap = len(q & _words(_card_text(c)))
-        if overlap:
-            scored.append((overlap, c.consumed_at, c))
-    scored.sort(key=lambda r: (r[0], r[1]), reverse=True)
-    matches = [r[2] for r in scored[:MAX_MATCHES]]
+
+    advice_lines = _fit([f"- [{c.consumed_at.astimezone(tz).date().isoformat()}] "
+                         + _flat(" | ".join(k.text for k in c.key_points), ADVICE_CHARS) for c in advice], ADVICE_BUDGET)
+    recent_lines = _fit([_line(c, tz) for c in recent], RECENT_BUDGET)
+    shown = " ".join(" ".join(recent_lines + advice_lines).lower().split())
+
+    evidence: list[Evidence] | None = None
     if index is not None:
-        found = _index_matches(store, index, question, used)
-        if found:
-            matches = found
+        try:
+            evidence = retrieve(index, question, k=MAX_EVIDENCE, expand=expand,
+                                sources=frozenset(CONTEXT_SOURCES)).items
+        except Exception:
+            evidence = None  # index missing or embedder unavailable: use the keyword fallback
+    if not evidence:  # no index, an index still being rebuilt, or nothing matched by meaning: try plain keywords
+        evidence = _keyword_evidence(cards, question, used)
+    evidence = [e for e in evidence if " ".join(e.text.lower().split())[:60] not in shown]  # already shown above
+    evidence_lines = _fit(format_evidence(evidence), EVIDENCE_BUDGET)
+    included = evidence[:len(evidence_lines)]
 
     out = ["GOALS:", _flat(goals_text, GOALS_CHARS) or "(none written)"]
     if profile.strip():
-        out += ["", "ABOUT HIM (profile written from his own onboarding answers):", _flat(profile, 1800)]
-    if advice:
-        out += ["", "EARLIER CONVERSATION (oldest first):"]
-        for c in advice:
-            out.append(f"- [{c.consumed_at.astimezone(tz).date().isoformat()}] "
-                       + _flat(" | ".join(k.text for k in c.key_points), 900))
-    if recent:
-        out += ["", "RECENT ENTRIES (newest first):"] + [_line(c, tz) for c in recent]
-    if matches:
-        out += ["", "OLDER ENTRIES THAT MATCH THE QUESTION:"] + [_line(c, tz) for c in matches]
+        out += ["", "ABOUT HIM:", _flat(profile, PROFILE_PACK_CHARS)]
+    if advice_lines:
+        out += ["", "EARLIER CONVERSATION (oldest first):"] + advice_lines
+    if recent_lines:
+        out += ["", "RECENT ENTRIES (newest first):"] + recent_lines
+    out += ["", "EVIDENCE FROM HIS NOTES (best matches to the question):"] + (evidence_lines or ["(nothing matched)"])
+    out += [coverage_line(included)]
     return redact_secrets("\n".join(out))[:PACK_CHARS]
 
 
 def build_prompt(question: str, context: str, extra: str = "") -> str:
     facts = f"FACTS (his commitments and patterns; you may cite the ids):\n{extra}\n\n" if extra.strip() else ""
     return (f"MEMORY (data about him, from his own private notes):\n{context}\n\n{facts}"
-            f"HIS QUESTION:\n{redact_secrets(question)[:QUESTION_CHARS]}")
+            f"{EVIDENCE_RULE}\n\nHIS QUESTION:\n{redact_secrets(question)[:QUESTION_CHARS]}")
 
 
 Runner = Callable[[str, str], str]  # (system, prompt) -> answer
@@ -214,7 +230,7 @@ def save_exchange(store: Store, question: str, answer: str, when: datetime, mess
 
 def ask(store: Store, question: str, goals_text: str, now: datetime, message_id: int | None = None,
         runner: Runner = claude_cli_runner, daily_limit: int = DEFAULT_DAILY_LIMIT, index=None,
-        system: str | None = None, extra: str = "", profile: str = "") -> str:
+        system: str | None = None, extra: str = "", profile: str = "", expand=None) -> str:
     question = question.strip()
     if not question:
         raise AdviceError("Write your question after the command, e.g. /ask should I take this offer?")
@@ -223,7 +239,7 @@ def ask(store: Store, question: str, goals_text: str, now: datetime, message_id:
                           "Journal it instead and ask tomorrow.")
     try:
         answer = runner(system or SYSTEM_PROMPT,
-                        build_prompt(question, build_context(store, question, goals_text, now, index, profile), extra))
+                        build_prompt(question, build_context(store, question, goals_text, now, index, profile, expand), extra))
     except AdviceError:
         # Claude failed: keep what he wrote anyway (as a plain journal entry), so nothing is lost.
         stamp = message_id if message_id is not None else int(now.timestamp())

@@ -173,3 +173,71 @@ def test_retry_survives_any_unexpected_crash_and_still_stops_on_bad_token():
         raise InvalidToken("nope")
 
     assert run_with_retries(bad, "123456:abc", sleep=lambda s: None) == 2
+
+
+def _eval_setup(tmp_path):
+    import json as _json
+    from datetime import datetime, timezone
+    from secondbrain.index import Index
+    from secondbrain.schema import Card, KeyPoint, Topic
+
+    settings = load_settings(root=tmp_path, env={})
+    store = Store(settings.root)
+    for cid, text in (("tg_a", "kubernetes networking and services explained for beginners"),
+                      ("tg_b", "terraform modules split state per environment for safety")):
+        store.write_card(Card(id=cid, source="telegram", type="thought", title=text[:40],
+                              consumed_at=datetime(2026, 11, 20, tzinfo=timezone.utc), topic=Topic(primary="uncertain"),
+                              key_points=[KeyPoint(text=text, topic="uncertain", confidence=1.0)]))
+    Index(settings.index_path, HashEmbedder()).rebuild(store)
+    settings.evals_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.evals_path.write_text(_json.dumps([
+        {"id": "q1", "question": "kubernetes networking services", "expect_ids": ["tg_a"]},
+        {"id": "q2", "question": "something about cooking pasta", "expect_ids": ["tg_b"]}]), encoding="utf-8")
+    return settings
+
+
+def test_eval_command_reports_recall_and_lists_misses(tmp_path):
+    from secondbrain.cli import run_eval_command
+    settings = _eval_setup(tmp_path)
+    lines: list[str] = []
+    assert run_eval_command(settings, HashEmbedder(), out=lines.append) == 0
+    text = "\n".join(lines)
+    assert "recall@5" in text and "MRR" in text and "q2" in text and "q1" not in text.split("misses")[-1]
+
+
+def test_eval_command_without_questions_explains_how_to_start(tmp_path):
+    from secondbrain.cli import run_eval_command
+    settings = load_settings(root=tmp_path, env={})
+    lines: list[str] = []
+    assert run_eval_command(settings, HashEmbedder(), out=lines.append) == 0
+    assert "--suggest" in "\n".join(lines)
+
+
+def test_eval_command_with_a_corrupt_file_fails_clearly(tmp_path, capsys):
+    from secondbrain.cli import run_eval_command
+    settings = load_settings(root=tmp_path, env={})
+    settings.evals_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.evals_path.write_text("{broken", encoding="utf-8")
+    assert run_eval_command(settings, HashEmbedder(), out=lambda s: None) == 2
+    assert "questions.json" in capsys.readouterr().err
+
+
+def test_eval_suggest_merges_without_overwriting_and_prints_the_caveat(tmp_path):
+    import json as _json
+    from secondbrain.cli import run_eval_suggest_command
+    settings = _eval_setup(tmp_path)
+    existing = _json.loads(settings.evals_path.read_text(encoding="utf-8"))
+    existing[0]["question"] = "MY OWN WORDING"
+    settings.evals_path.write_text(_json.dumps(existing), encoding="utf-8")
+    lines: list[str] = []
+    llm = FnProvider(lambda prompt: _json.dumps({"question": "a drafted question"}))
+    assert run_eval_suggest_command(settings, llm, 5, out=lines.append) == 0
+    saved = {q["id"]: q for q in _json.loads(settings.evals_path.read_text(encoding="utf-8"))}
+    assert saved["q1"]["question"] == "MY OWN WORDING"          # his own edit is never overwritten
+    assert "smoke test" in "\n".join(lines)
+
+
+def test_parser_has_eval_command():
+    from secondbrain.cli import build_parser
+    args = build_parser().parse_args(["eval", "--suggest", "12"])
+    assert args.command == "eval" and args.suggest == 12

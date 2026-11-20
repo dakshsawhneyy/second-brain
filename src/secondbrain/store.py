@@ -51,6 +51,23 @@ class Store:
             raise KeyError(id)
         return Card.model_validate_json(path.read_text(encoding="utf-8"))
 
+    def delete_card(self, id: str) -> bool:
+        """Remove a card's file. Used only for derived cards (digests) whose source notes are gone or private."""
+        if not ID_RE.match(id):
+            return False
+        removed = False
+        for path in self.cards_dir.glob(f"*/*/{id}.json"):
+            path.unlink(missing_ok=True)
+            removed = True
+        return removed
+
+    def iter_card_files(self) -> Iterator[Path]:
+        """Every card file, without parsing it (the index decides which ones changed)."""
+        yield from sorted(self.cards_dir.glob("*/*/*.json"))
+
+    def read_card_file(self, path: Path) -> Card:
+        return Card.model_validate_json(Path(path).read_text(encoding="utf-8"))
+
     def iter_cards(self) -> Iterator[Card]:
         self.corrupt_files = []
         for path in sorted(self.cards_dir.glob("*/*/*.json")):

@@ -525,6 +525,14 @@
       ],
       "default": null,
       "title": "Reply To"
+    },
+    "derived_from": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 200,
+      "title": "Derived From",
+      "type": "array"
     }
   },
   "required": [

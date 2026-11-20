@@ -1,0 +1,7 @@
+[
+  {
+    "id": "q_example",
+    "question": "What did I decide about cold outreach?",
+    "expect_ids": ["tg_123"]
+  }
+]

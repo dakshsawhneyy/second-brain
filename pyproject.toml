@@ -11,6 +11,8 @@ dependencies = [
     "numpy>=1.26",
     "python-telegram-bot>=21",
     "cryptography>=42",
+    "faster-whisper>=1.0",
+    "av>=14,<16",  # newer av breaks faster-whisper (metadata_errors)
 ]
 
 [project.scripts]

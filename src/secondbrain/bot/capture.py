@@ -8,7 +8,7 @@ from datetime import datetime
 
 from ..schema import Action, Card, KeyPoint, Topic
 
-_PREFIX = re.compile(r"^\s*(book|idea|friction|experiment|decided|done|made|todo|journal|private)\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_PREFIX = re.compile(r"^\s*(book|idea|friction|experiment|decided|done|made|todo|journal|private|thought)\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
 _URL_ONLY = re.compile(r"^https?://\S+$")
 _PREFIX_TYPES = {
     "book": "book",
@@ -20,6 +20,7 @@ _PREFIX_TYPES = {
     "made": "produced",
     "todo": "thought",
     "journal": "thought",
+    "thought": "thought",
     "private": "thought",
 }
 TITLE_MAX = 80

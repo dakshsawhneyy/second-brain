@@ -23,7 +23,7 @@ Each item becomes a private card (a small JSON file in cards/). Nothing leaves y
 3. It plans your day
 - 09:00-14:00: morning brief = what you did yesterday, one action for today, and a short list below it.
 - Actions come from: your own todos first, then leftovers from sessions in your two focus projects, then high-scoring videos.
-- Tidy the list: /done 2, /skip 2 (the number is the line in the brief). Under the main action use its buttons.
+- Tidy the list: /done 2 (the number is the line in the brief). Under the main action use its Done / Later / Skip buttons.
 - From 21:30: evening check-in. Just write what you did
 
 4. It checks you
@@ -37,8 +37,9 @@ He starts with a few days of questions to get to know you, then every morning as
 /brief  today's plan again
 /evening  the check-in
 /ask  personal advice from Claude
-/done N /skip N  tidy the brief
-/todo /private  the only two special writes
+/done N  tidy the brief
+/thought  store a thought silently
+/todo /private /book  special writes
 /summary  this page
 /start  the full list of commands, with examples"""
 

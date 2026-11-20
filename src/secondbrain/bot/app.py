@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import (
     Application,
@@ -21,6 +21,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -29,6 +30,7 @@ from .brief import Brief, apply_feedback, build_evening_checkin, build_morning_b
 from .. import usage
 from ..advisor import AdviceError, ask as ask_advice
 from ..schema import Topic
+from ..inbox import MAX_TRIES
 from ..sessions import redact_secrets
 from .capture import _PREFIX as _PREFIX_RE, parse_capture
 from .classify import MIN_CHARS
@@ -121,14 +123,14 @@ def _markup(brief: Brief) -> InlineKeyboardMarkup | None:
 
 HELP_TEXT = """Second brain online.
 
-Just type. Anything you send (a thought, a journal entry, what you learned from a book, a link) is saved automatically.
+Just type or talk. Anything you send (a thought, a journal entry, what you learned from a book, a link, a voice note) is saved automatically. Reply to a mentor message to answer him; send on its own to just log it.
 
 Commands, only where the bot must act differently:
 /brief - today's plan
 /book <text> - your reading log: what you read, learned, understood, ideas to try (or: Title | learned | how I'll use it)
 /todo <task> - put a task on your list
 /done <thing> - log something you finished (or /done 2 to tick line 2 of the brief)
-/skip 2 - drop line 2 of the brief
+/thought <text> - store a thought silently (no reply)
 /ask <question> - personal advice from Claude, using your notes
 /private <text> - saved, but never sent to Claude
 /usage - Claude calls and tokens per section (for the quota)
@@ -159,7 +161,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 _COMMAND_HEAD = re.compile(r"^\s*/\w+(?:@\w+)?\s*", re.DOTALL)
-CAPTURE_COMMANDS = ("private", "todo", "done", "book")
+CAPTURE_COMMANDS = ("private", "todo", "done", "book", "thought")
 
 
 def _body(message, context) -> str:
@@ -220,7 +222,46 @@ def _is_reply_to_latest_mentor_message(message, mentor) -> bool:
     return bool(latest) and latest in replied
 
 
-async def _save_capture(update: Update, d, raw: str):
+# A bare command (/thought with no text) opens the reply box with a placeholder; what he types next is that command's text.
+PROMPTS = {
+    "thought": ("Your thought:", "Type your thought here"),
+    "book": ("What did you read and learn today?", "What I read, learned, ideas to try..."),
+    "todo": ("What is the task?", "Type the task here"),
+    "private": ("Your private note (saved, never sent to Claude):", "Type it here"),
+    "done": ("What did you finish?", "Type what you finished"),
+    "ask": ("What is your question for Claude?", "Type your question here"),
+}
+PROMPT_KIND = {text: kind for kind, (text, _) in PROMPTS.items()}
+
+
+def _prompt_kind(message) -> str | None:
+    """The command a message answers, when it is a reply to one of the bot's own prompts above."""
+    target = getattr(message, "reply_to_message", None)
+    if target is None:
+        return None
+    sender = getattr(target, "from_user", None)
+    if sender is not None and not getattr(sender, "is_bot", True):
+        return None  # only the bot's own prompts count
+    return PROMPT_KIND.get(getattr(target, "text", None))
+
+
+async def _send_prompt(message, kind: str) -> None:
+    text, placeholder = PROMPTS[kind]
+    await message.reply_text(text, reply_markup=ForceReply(input_field_placeholder=placeholder))
+
+
+async def _acknowledge_quietly(message) -> None:
+    """A thumbs-up reaction instead of a reply: confirms the save without a message or notification."""
+    react = getattr(message, "set_reaction", None)
+    if react is None:
+        return
+    try:
+        await react("\U0001F44D")
+    except Exception as e:  # purely cosmetic
+        log.warning("could not react: %s", type(e).__name__)
+
+
+async def _save_capture(update: Update, d, raw: str, quiet: bool = False):
     message = update.message
     when = getattr(message, "date", None) or d["now"]()  # the message's own send time, not processing time
     try:
@@ -230,9 +271,20 @@ async def _save_capture(update: Update, d, raw: str):
         await message.reply_text("I couldn't save that: there was no text after the command.")
         return None
     d["store"].write_card(card)
+    if quiet:
+        await _acknowledge_quietly(message)
+        return card
     label = "privately (never sent to Claude)" if card.channel == "local-only" else card.type
     await message.reply_text(f"Saved: {label}")
     return card
+
+
+async def _run_capture_command(update: Update, d, kind: str, body: str) -> None:
+    """/thought is silent and skips suggestions; the others confirm, and book/private also look for related notes."""
+    card = await _save_capture(update, d, f"{kind}: {body}", quiet=(kind == "thought"))
+    _inbox_done(d, getattr(update.message, "message_id", None))
+    if kind in ("book", "private"):
+        await _suggest_related(update, d, card)
 
 
 async def _reclassify(d, card) -> None:
@@ -256,11 +308,12 @@ def _capture_command(kind: str):
             return
         body = _body(update.message, context)
         if not body:
-            await update.message.reply_text(f"Write it after the command, like: /{kind} your text")
+            if kind in PROMPTS:
+                await _send_prompt(update.message, kind)
+            else:
+                await update.message.reply_text(f"Write it after the command, like: /{kind} your text")
             return
-        card = await _save_capture(update, d, f"{kind}: {body}")
-        if kind in ("book", "private"):
-            await _suggest_related(update, d, card)
+        await _run_capture_command(update, d, kind, body)
     return handler
 
 
@@ -298,7 +351,7 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(part)
 
 
-async def _mentor_route(update: Update, d, mentor) -> bool:
+async def _mentor_route(update: Update, d, mentor, text: str, strict: bool = False) -> bool:
     """Hand a plain message to the mentor flow when it is waiting for an answer. True = handled."""
     awaiting = mentor.awaiting()
     handler = {"onboarding": mentor.handle_onboarding_answer, "commitments": mentor.handle_commitments,
@@ -306,19 +359,51 @@ async def _mentor_route(update: Update, d, mentor) -> bool:
     if handler is None:
         return False
     message = update.message
+    if strict and getattr(message, "reply_to_message", None) is None:
+        return False  # strict (voice): only an explicit reply to the mentor counts as answering him
     if not _is_reply_to_latest_mentor_message(message, mentor):
         return False  # he is replying to some OTHER message: save it as a note with that context, not as the answer
     when = _local_time(message, d)
     try:
-        reply = await asyncio.to_thread(handler, message.text, when, getattr(message, "message_id", None))
+        reply = await asyncio.to_thread(handler, text, when, getattr(message, "message_id", None))
     except Exception as e:  # never lose his message because the mentor failed: fall through to normal capture
         log.warning("mentor flow failed (%s): %s", awaiting, type(e).__name__)
         return False
     if reply is None:
         return False
-    for part in _chunks(reply):
-        await message.reply_text(part)
+    _inbox_done(d, getattr(message, "message_id", None))  # saved and the mentor moved on: never replay it
+    await _reply_or_queue(message, d, reply)
     return True
+
+
+async def _reply_or_queue(message, d, text: str) -> None:
+    """Send a reply. If Telegram or the network fails, keep it in the outbox and retry later (never lose an answer)."""
+    outbox = d.get("outbox")
+    queued = False
+    for part in _chunks(text):
+        if not queued:
+            try:
+                await message.reply_text(part)
+                continue
+            except (TelegramError, OSError) as e:
+                if outbox is None:
+                    raise
+                log.warning("reply not delivered, queued for retry: %s", type(e).__name__)
+                queued = True  # everything after it is queued too, so the order is kept
+        outbox.add(part)
+
+
+async def _flush_outbox(app: Application) -> None:
+    d = app.bot_data
+    outbox = d.get("outbox")
+    if outbox is None:
+        return
+    for oid, text in outbox.pending():
+        try:
+            await app.bot.send_message(chat_id=d["owner_id"], text=text)
+        except (TelegramError, OSError):
+            return  # still offline: try again on the next tick, keeping the order
+        outbox.done(oid)
 
 
 def _chunks(text: str, size: int = 3900) -> list[str]:
@@ -329,8 +414,15 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     d = context.bot_data
     if not is_owner(update, d.get("owner_id")) or update.message is None:
         return
+    question = _body(update.message, context)
+    if not question:
+        await _send_prompt(update.message, "ask")
+        return
+    await _do_ask(update, d, question)
+
+
+async def _do_ask(update: Update, d, question: str) -> None:
     message = update.message
-    question = _body(message, context)
     when = _local_time(message, d)
     runner = d.get("ask_runner")
     kwargs = {"runner": runner} if runner else {}
@@ -347,8 +439,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except AdviceError as e:
         await message.reply_text(f"Could not answer: {e}")
         return
-    for part in _chunks(answer):
-        await message.reply_text(part)
+    await _reply_or_queue(message, d, answer)
 
 
 def _mark_command(verb: str):
@@ -359,6 +450,9 @@ def _mark_command(verb: str):
         args = context.args or []
         if verb == "done" and args and not (len(args) == 1 and args[0].isdigit()):
             await _save_capture(update, d, f"done: {_body(update.message, context)}")  # /done fixed the login bug
+            return
+        if verb == "done" and not args:
+            await _send_prompt(update.message, "done")
             return
         if len(args) != 1 or not args[0].isdigit():
             await update.message.reply_text(
@@ -380,13 +474,195 @@ def _mark_command(verb: str):
     return handler
 
 
+_COMMAND_RE = re.compile(r"^\s*/(\w+)(?:@\w+)?\s*(.*)$", re.DOTALL)
+REPLAY_AFTER_SECONDS = 90  # give the normal handler time to finish before the retry loop picks a message up
+
+
+def _capture_raw(text: str) -> str | None:
+    """The capture text for a message worth keeping (plain text, or /book /todo /private /done <text>); else None."""
+    if not text or not text.strip():
+        return None
+    match = _COMMAND_RE.match(text)
+    if not match:
+        return text
+    name, body = match.group(1).lower(), match.group(2).strip()
+    if name not in CAPTURE_COMMANDS or not body or (name == "done" and body.isdigit()):
+        return None
+    return f"{name}: {body}"
+
+
+def _inbox_done(d, mid) -> None:
+    inbox = d.get("inbox")
+    if inbox is not None and mid is not None:
+        try:
+            inbox.done(mid)
+        except Exception as e:  # never let bookkeeping break a message
+            log.warning("inbox cleanup failed: %s", type(e).__name__)
+
+
+async def _record_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs first for every update: write the message to the durable inbox before anything can fail."""
+    d = context.bot_data
+    message = getattr(update, "message", None)
+    inbox = d.get("inbox")
+    if inbox is None or message is None or not is_owner(update, d.get("owner_id")):
+        return
+    mid = getattr(message, "message_id", None)
+    if mid is None:
+        return
+    when = (getattr(message, "date", None) or d["now"]()).isoformat()
+    media = getattr(message, "voice", None) or getattr(message, "audio", None)
+    try:
+        if media is not None:
+            inbox.add(mid, {"kind": "voice", "file_id": media.file_id, "dur": int(getattr(media, "duration", 0) or 0),
+                            "date": when, "reply": _reply_context(message)})
+        else:
+            raw = _capture_raw(getattr(message, "text", "") or "")
+            kind = _prompt_kind(message)
+            if kind == "ask":
+                raw = None  # never replay a Claude call
+            elif kind is not None and raw is not None:
+                raw = f"{kind}: {raw}"
+            if raw is not None:
+                inbox.add(mid, {"kind": "text", "text": raw, "date": when, "reply": _reply_context(message)})
+    except Exception as e:
+        log.warning("could not record inbound message: %s", type(e).__name__)
+
+
+async def _replay_inbox(app: Application) -> None:
+    """Retry anything still in the inbox: a message whose handling crashed, or a voice note that could not be processed."""
+    d = app.bot_data
+    inbox = d.get("inbox")
+    if inbox is None:
+        return
+    inflight = d.setdefault("inflight", set())
+    for mid, entry in inbox.pending():
+        if mid in inflight or time_module.time() - float(entry.get("at", 0)) < REPLAY_AFTER_SECONDS:
+            continue
+        if entry.get("gave_up"):
+            continue
+        if inbox.bump(mid) > MAX_TRIES:
+            inbox.mark_gave_up(mid)
+            await app.bot.send_message(chat_id=d["owner_id"], text="I could not process one of your messages after many "
+                                       "tries. It is still kept on your computer, so nothing is lost.")
+            continue
+        try:
+            when = datetime.fromisoformat(entry["date"])
+            heard = None
+            if entry["kind"] == "voice":
+                transcriber = d.get("transcriber")
+                if transcriber is None:
+                    continue
+                import io
+
+                file = await app.bot.get_file(entry["file_id"])
+                audio = io.BytesIO(bytes(await file.download_as_bytearray()))
+                text = (await asyncio.to_thread(transcriber.transcribe, audio)).strip()
+                if not text:
+                    inbox.done(mid)
+                    continue
+                raw, heard = text, text
+            else:
+                raw = entry["text"]
+            if not any(d["store"].has(f"{p}_{mid}") for p in ("tg", "mo")):  # a card means the first attempt saved it
+                d["store"].write_card(parse_capture(raw, when, message_id=mid, reply_to=entry.get("reply")))
+        except Exception as e:
+            log.warning("retrying message %s failed: %s", mid, type(e).__name__)
+            continue
+        inbox.done(mid)
+        note = ("Recovered a voice note you sent earlier and saved it." if heard
+                else "Recovered a message you sent earlier and saved it.")
+        if heard:
+            note += "\nHeard: " + heard[:HEARD_PREVIEW]
+        try:
+            await app.bot.send_message(chat_id=d["owner_id"], text=note)
+        except TelegramError as e:
+            log.warning("could not announce recovered message: %s", type(e).__name__)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     d = context.bot_data
     if not is_owner(update, d.get("owner_id")) or update.message is None or not update.message.text:
         return
-    raw = update.message.text
+    mid = update.message.message_id
+    d.setdefault("inflight", set()).add(mid)
+    try:
+        await _process_text(update, d, update.message.text)
+        _inbox_done(d, mid)
+    finally:
+        d["inflight"].discard(mid)
+
+
+MAX_VOICE_SECONDS = 20 * 60  # Telegram bots can download files up to 20 MB; this keeps transcription reasonable
+HEARD_PREVIEW = 600
+
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A voice note is text you spoke: transcribed locally, then handled exactly like a typed message.
+
+    A voice note sent as a REPLY to the mentor answers him; one sent on its own is a normal note.
+    """
+    d = context.bot_data
+    message = update.message
+    if not is_owner(update, d.get("owner_id")) or message is None:
+        return
+    media = getattr(message, "voice", None) or getattr(message, "audio", None)
+    transcriber = d.get("transcriber")
+    if media is None:
+        return
+    mid = getattr(message, "message_id", None)
+    if transcriber is None:
+        await message.reply_text("Voice notes are not set up on this bot yet.")
+        _inbox_done(d, mid)
+        return
+    seconds = int(getattr(media, "duration", 0) or 0)
+    if seconds > MAX_VOICE_SECONDS:
+        _inbox_done(d, mid)
+        await message.reply_text(f"That voice note is too long ({seconds // 60} min). Keep each one under {MAX_VOICE_SECONDS // 60} minutes.")
+        return
+    d.setdefault("inflight", set()).add(mid)
+    try:
+        await _handle_voice(update, d, message, media, transcriber, seconds, mid)
+    finally:
+        d["inflight"].discard(mid)
+
+
+async def _handle_voice(update, d, message, media, transcriber, seconds: int, mid) -> None:
+    if seconds >= 30:
+        await message.reply_text("Transcribing...")
+    try:
+        import io
+
+        file = await media.get_file()
+        audio = io.BytesIO(bytes(await file.download_as_bytearray()))
+        text = await asyncio.to_thread(transcriber.transcribe, audio)
+    except Exception as e:  # download or transcription failed: say so, never lose it silently
+        log.warning("voice note failed: %s", type(e).__name__)
+        try:  # it stays in the inbox and is retried automatically, so this reply is only a courtesy
+            await message.reply_text("I could not process that voice note right now. I have kept it and will retry automatically.")
+        except TelegramError:
+            pass
+        return
+    if not text.strip():
+        _inbox_done(d, mid)
+        await message.reply_text("I couldn't make out any speech in that voice note.")
+        return
+    preview = text if len(text) <= HEARD_PREVIEW else text[:HEARD_PREVIEW].rstrip() + "... (full text saved)"
+    await message.reply_text(f"Heard: {preview}")
+    await _process_text(update, d, text, strict_mentor=True)
+    _inbox_done(d, mid)
+
+
+async def _process_text(update: Update, d, raw: str, strict_mentor: bool = False) -> None:
+    kind = _prompt_kind(update.message)
+    if kind == "ask":
+        await _do_ask(update, d, raw)
+        return
+    if kind is not None:
+        await _run_capture_command(update, d, kind, raw)
+        return
     mentor = d.get("mentor")
-    if mentor is not None and await _mentor_route(update, d, mentor):
+    if mentor is not None and await _mentor_route(update, d, mentor, raw, strict=strict_mentor):
         return
     card = await _save_capture(update, d, raw)
     await _suggest_related(update, d, card)
@@ -563,7 +839,7 @@ async def _scheduler(app: Application) -> None:
             await run_due_jobs(send, d["store"], d.get("goals_text", ""), d["now"](), d["state_path"], d.get("focus_projects"))
         except Exception as e:
             log.warning("scheduler: due jobs failed: %s", redact(str(e), d.get("token", "")))
-        for step in (lambda: _send_alerts(app), mentor_tick):  # one failing step must not block the other
+        for step in (lambda: _flush_outbox(app), lambda: _replay_inbox(app), lambda: _send_alerts(app), mentor_tick):  # one failing step must not block the other
             try:
                 await step()
             except Exception as e:
@@ -573,7 +849,7 @@ async def _scheduler(app: Application) -> None:
 
 MENU_COMMANDS = [
     ("brief", "today's plan"), ("todo", "put a task on your list"),
-    ("book", "log what you read and learned"), ("done", "log a finished thing, or /done 2"), ("skip", "drop a brief item: /skip 2"),
+    ("book", "log what you read and learned"), ("done", "log a finished thing, or /done 2"), ("thought", "store a thought silently"),
     ("ask", "personal advice from Claude"), ("private", "save something Claude never sees"),
     ("summary", "how it all works"), ("usage", "what Claude calls cost you"),
 ]
@@ -632,6 +908,9 @@ def build_application(
     classifier: Callable[[str], tuple[str, str]] | None = None,
     index=None,
     mentor=None,
+    transcriber=None,
+    inbox=None,
+    outbox=None,
 ) -> Application:
     if not token:
         raise ValueError("a Telegram bot token is required")
@@ -650,11 +929,12 @@ def build_application(
     )
     app.bot_data.update(
         token=token, owner_id=owner_id, store=store, goals_text=goals_text, state_path=Path(state_path),
-        focus_projects=focus_projects, classifier=classifier, index=index, mentor=mentor,
+        focus_projects=focus_projects, classifier=classifier, index=index, mentor=mentor, transcriber=transcriber, inbox=inbox, outbox=outbox,
         now=now or (lambda: datetime.now().astimezone()),
     )
 
     only_owner = filters.User(user_id=owner_id) & filters.ChatType.PRIVATE  # defence in depth: handlers re-check
+    app.add_handler(TypeHandler(Update, _record_inbound), group=-1)  # first: write every message to disk
     app.add_handler(CommandHandler(["start", "help"], cmd_start, filters=only_owner))
     app.add_handler(CommandHandler("brief", cmd_brief, filters=only_owner))
     app.add_handler(CommandHandler("summary", cmd_summary, filters=only_owner))
@@ -663,9 +943,10 @@ def build_application(
     for kind in CAPTURE_COMMANDS:
         if kind != "done":  # /done is registered below: it handles both "/done 2" and "/done <text>"
             app.add_handler(CommandHandler(kind, _capture_command(kind), filters=only_owner))
-    for verb in ("done", "skip"):
+    for verb in ("done",):
         app.add_handler(CommandHandler(verb, _mark_command(verb), filters=only_owner))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & only_owner, on_text))
+    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & only_owner, on_voice))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(_on_error)
     return app

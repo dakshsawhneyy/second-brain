@@ -165,7 +165,7 @@ def build_morning_brief(store: Store, goals_text: str, now: datetime,
     if len(picks) > 1:
         lines += ["", "Also on your list:"]
         lines += [f"{i}. {_flat(c.action.text, ACTION_MAX)}{_age_note(c, now)}" for i, c in enumerate(picks[1:], start=2)]
-        lines += ["Drop one with /skip 2, finish with /done 2."]
+        lines += ["Drop one with its Skip button, finish with /done 2."]
     if not (own_done or worked_on):
         lines += ["", "Nothing shipped was logged yesterday. Do the smallest item first, then log it: /done <what you shipped>"]
 

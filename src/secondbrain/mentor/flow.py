@@ -75,11 +75,20 @@ class Mentor:
     def awaiting(self) -> str | None:
         return self.state.load().get("awaiting")
 
+    def _onboarding_path(self) -> Path | None:
+        """Where the generated interview profile lives. profile.md is HIS file and is never written by the mentor."""
+        return self.profile_path.with_name("onboarding.md") if self.profile_path else None
+
     def _profile_text(self) -> str:
-        try:
-            return self.profile_path.read_text(encoding="utf-8")[:3000] if self.profile_path else ""
-        except OSError:
-            return ""
+        """His hand-written profile.md (background, skills) followed by the generated onboarding profile."""
+        parts: list[str] = []
+        for path, limit in ((self.profile_path, 1200), (self._onboarding_path(), 3000)):
+            try:
+                if path is not None:
+                    parts.append(path.read_text(encoding="utf-8").strip()[:limit])
+            except OSError:
+                continue
+        return "\n\n".join(p for p in parts if p)[:3000]
 
     def _say(self, **kw) -> str:
         spoken = self.vikram.say(**kw)
@@ -144,10 +153,11 @@ class Mentor:
                 text = self.runner(PROFILE_SYSTEM, prompt).strip()
         except AdviceError:
             text = qa
-        if self.profile_path:
-            self.profile_path.parent.mkdir(parents=True, exist_ok=True)
-            self.profile_path.write_text(f"# About Daksh (written {now.date().isoformat()} from his onboarding answers)\n\n"
-                                         f"{text}\n", encoding="utf-8")
+        target = self._onboarding_path()
+        if target is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"# About Daksh (written {now.date().isoformat()} from his onboarding answers)\n\n"
+                              f"{text}\n", encoding="utf-8")
         return text
 
     # --- M3: morning and evening -------------------------------------------------------------------------

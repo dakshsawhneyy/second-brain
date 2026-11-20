@@ -431,7 +431,7 @@ def test_ask_without_question_and_strangers(store):
     ctx.args = []
     u = make_update(text="/ask")
     run(cmd_ask(u, ctx))
-    assert u.message.replies[0][0].startswith("Could not answer")
+    assert u.message.replies[0][0] == "What is your question for Claude?"  # a bare /ask opens a reply box
     s = make_update(user_id=STRANGER, text="/ask hi")
     ctx.args = ["hi"]
     run(cmd_ask(s, ctx))
@@ -484,7 +484,7 @@ def test_all_capture_commands_are_registered(store):
     from secondbrain.bot.app import CAPTURE_COMMANDS
     app = build_application("123:abc", OWNER, store, "", store.root / "s.json")
     names = {c for h in app.handlers[0] if hasattr(h, "commands") for c in h.commands}
-    assert set(CAPTURE_COMMANDS) <= names and {"ask", "brief", "summary", "skip"} <= names and not {"later", "evening", "journal"} & names
+    assert set(CAPTURE_COMMANDS) <= names and {"ask", "brief", "summary"} <= names and not {"skip", "later", "evening", "journal"} & names
 
 
 def test_book_command_keeps_the_whole_reading_log(store):
@@ -595,3 +595,200 @@ def test_reply_to_an_old_message_is_not_taken_as_the_mentors_answer(store):
     run(on_text(u, ctx))
     assert mentor.answered == ["Yes I am"]
     assert store.read_card("tg_131").reply_to.startswith("Morning brief")
+
+
+class FakeTranscriber:
+    def __init__(self, text="I want to blabber about my day and what I learned", fail=False):
+        self.text, self.fail = text, fail
+
+    def transcribe(self, audio):
+        if self.fail:
+            raise RuntimeError("boom")
+        return self.text
+
+
+def _voice_update(message_id, seconds=12, reply_text=None):
+    u = make_update(text=None, message_id=message_id)
+
+    class _File:
+        async def download_as_bytearray(self):
+            return bytearray(b"OggS-fake")
+
+    class _Voice:
+        duration = seconds
+
+        async def get_file(self):
+            return _File()
+
+    u.message.voice = _Voice()
+    u.message.audio = None
+    if reply_text is not None:
+        u.message.reply_to_message = SimpleNamespace(text=reply_text, caption=None)
+    return u
+
+
+def test_a_standalone_voice_note_is_saved_like_normal_text(store):
+    from secondbrain.bot.app import on_voice
+    ctx = make_ctx(store)
+    ctx.bot_data["transcriber"] = FakeTranscriber()
+    u = _voice_update(140)
+    run(on_voice(u, ctx))
+    assert u.message.replies[0][0].startswith("Heard: I want to blabber")
+    assert store.read_card("tg_140").key_points[0].text.startswith("I want to blabber")
+
+
+def test_voice_note_answers_the_mentor_only_when_sent_as_a_reply_to_him(store):
+    from secondbrain.bot.app import on_voice
+
+    class FakeState:
+        def sent(self):
+            return ["Are you coachable? Will you tell me the truth?"]
+
+    class FakeMentor:
+        state = FakeState()
+
+        def __init__(self):
+            self.answered = []
+
+        def awaiting(self):
+            return "onboarding"
+
+        def handle_onboarding_answer(self, text, when, message_id):
+            self.answered.append(text)
+            return "mentor reply"
+
+        handle_commitments = handle_closeout = None
+
+    mentor = FakeMentor()
+    ctx = make_ctx(store)
+    ctx.bot_data.update(mentor=mentor, transcriber=FakeTranscriber("Yes I am coachable, honestly"))
+    # direct voice note while the mentor waits: a normal note, NOT his answer
+    u = _voice_update(141)
+    run(on_voice(u, ctx))
+    assert mentor.answered == [] and store.has("tg_141")
+    # voice note sent as a reply to the mentor's latest message: his answer
+    u = _voice_update(142, reply_text="Hello Daksh. Are you coachable? Will you tell me the truth?")
+    run(on_voice(u, ctx))
+    assert mentor.answered == ["Yes I am coachable, honestly"] and u.message.replies[-1][0] == "mentor reply"
+
+
+def test_voice_failures_and_limits_never_lose_the_message_silently(store):
+    from secondbrain.bot.app import MAX_VOICE_SECONDS, on_voice
+    ctx = make_ctx(store)
+    u = _voice_update(143)
+    run(on_voice(u, ctx))  # no transcriber configured
+    assert "not set up" in u.message.replies[0][0]
+    ctx.bot_data["transcriber"] = FakeTranscriber(fail=True)
+    u = _voice_update(144)
+    run(on_voice(u, ctx))
+    assert "kept it and will retry" in u.message.replies[0][0] and not store.has("tg_144")
+    ctx.bot_data["transcriber"] = FakeTranscriber("   ")
+    u = _voice_update(145)
+    run(on_voice(u, ctx))
+    assert "couldn't make out" in u.message.replies[0][0]
+    ctx.bot_data["transcriber"] = FakeTranscriber()
+    u = _voice_update(146, seconds=MAX_VOICE_SECONDS + 5)
+    run(on_voice(u, ctx))
+    assert "too long" in u.message.replies[0][0] and not store.has("tg_146")
+    u = _voice_update(147, seconds=90)
+    run(on_voice(u, ctx))
+    assert u.message.replies[0][0] == "Transcribing..."
+
+
+def test_voice_handler_is_registered_for_the_owner(store):
+    app = build_application("123:abc", OWNER, store, "", store.root / "s.json")
+    assert any("VOICE" in repr(getattr(h, "filters", "")) for h in app.handlers[0])
+
+
+def _bot_prompt_reply(update, prompt_text):
+    update.message.reply_to_message = SimpleNamespace(text=prompt_text, caption=None, from_user=SimpleNamespace(is_bot=True))
+    return update
+
+
+def test_thought_command_stores_silently_with_a_reaction_only(store):
+    from secondbrain.bot.app import _capture_command
+    ctx = make_ctx(store)
+    ctx.args = []
+    reactions = []
+    u = make_update(text="/thought I keep avoiding cold outreach", message_id=400)
+
+    async def react(emoji):
+        reactions.append(emoji)
+
+    u.message.set_reaction = react
+    run(_capture_command("thought")(u, ctx))
+    assert u.message.replies == []                         # no reply message at all
+    assert reactions == ["\U0001F44D"]                     # only a quiet thumbs-up
+    card = store.read_card("tg_400")
+    assert card.type == "thought" and card.key_points[0].text == "I keep avoiding cold outreach"
+
+
+def test_thought_command_makes_no_related_notes_reply(store):
+    from secondbrain.bot.app import _capture_command
+
+    class Index:
+        def related(self, *a, **k):
+            raise AssertionError("must not search")
+
+    ctx = make_ctx(store)
+    ctx.args = []
+    ctx.bot_data["index"] = Index()
+    u = make_update(text="/thought something worth remembering for later", message_id=401)
+    run(_capture_command("thought")(u, ctx))
+    assert u.message.replies == [] and store.has("tg_401")
+
+
+def test_bare_commands_open_a_reply_box_and_the_next_message_becomes_that_command(store):
+    from secondbrain.bot.app import PROMPTS, _capture_command, on_text
+    from telegram import ForceReply
+    ctx = make_ctx(store)
+    ctx.args = []
+    u = make_update(text="/thought", message_id=410)
+    run(_capture_command("thought")(u, ctx))
+    text, kwargs = u.message.replies[0]
+    assert text == PROMPTS["thought"][0] and isinstance(kwargs["reply_markup"], ForceReply)
+    assert kwargs["reply_markup"].input_field_placeholder == PROMPTS["thought"][1]
+    assert not store.has("tg_410")                         # nothing saved for the bare command itself
+    # he types into the box: it arrives as a reply to that prompt and is stored as a thought, silently
+    r = _bot_prompt_reply(make_update(text="my real thought, typed in the box", message_id=411), PROMPTS["thought"][0])
+    run(on_text(r, ctx))
+    assert r.message.replies == [] and store.read_card("tg_411").key_points[0].text == "my real thought, typed in the box"
+    # same for /todo: replying gives a todo with an action, and the usual confirmation
+    r = _bot_prompt_reply(make_update(text="email two recruiters", message_id=412), PROMPTS["todo"][0])
+    run(on_text(r, ctx))
+    assert store.read_card("tg_412").action.text == "email two recruiters" and r.message.replies[0][0] == "Saved: thought"
+
+
+def test_reply_to_the_ask_box_asks_claude_and_a_stranger_reply_does_not_count(store):
+    from secondbrain.bot.app import PROMPTS, on_text
+    ctx = make_ctx(store)
+    ctx.bot_data["ask_runner"] = lambda s, p: "Do the outreach first."
+    r = _bot_prompt_reply(make_update(text="what should I do first?", message_id=420), PROMPTS["ask"][0])
+    run(on_text(r, ctx))
+    assert any("Do the outreach first." in t for t, _ in r.message.replies)
+    # a reply to a message that merely has the same text but is NOT from the bot is an ordinary note
+    r = make_update(text="a normal note", message_id=421)
+    r.message.reply_to_message = SimpleNamespace(text=PROMPTS["thought"][0], caption=None, from_user=SimpleNamespace(is_bot=False))
+    run(on_text(r, ctx))
+    assert r.message.replies[0][0] == "Saved: thought" and store.read_card("tg_421").type == "thought"
+
+
+def test_skip_command_is_gone_but_done_and_thought_are_registered(store):
+    app = build_application("123:abc", OWNER, store, "", store.root / "s.json")
+    names = {c for h in app.handlers[0] if hasattr(h, "commands") for c in h.commands}
+    assert "skip" not in names and {"thought", "done", "ask"} <= names
+    from secondbrain.bot.app import MENU_COMMANDS
+    assert "skip" not in [c for c, _ in MENU_COMMANDS] and "thought" in [c for c, _ in MENU_COMMANDS]
+
+
+def test_prompt_reply_is_remembered_in_the_inbox_with_its_command(store, tmp_path):
+    from secondbrain.bot.app import PROMPTS, _record_inbound
+    from secondbrain.inbox import Inbox
+    ctx = make_ctx(store)
+    ctx.bot_data["inbox"] = Inbox(tmp_path / "inbox.json")
+    r = _bot_prompt_reply(make_update(text="learned that small wins compound", message_id=430), PROMPTS["book"][0])
+    run(_record_inbound(r, ctx))
+    assert ctx.bot_data["inbox"].pending()[0][1]["text"] == "book: learned that small wins compound"
+    a = _bot_prompt_reply(make_update(text="a question for claude", message_id=431), PROMPTS["ask"][0])
+    run(_record_inbound(a, ctx))
+    assert [m for m, _ in ctx.bot_data["inbox"].pending()] == [430]   # an /ask is never replayed

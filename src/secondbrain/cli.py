@@ -361,6 +361,18 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
                 mentor = Mentor(store, settings.raw_dir / "mentor_state.json", claude_cli_runner, local_llm=label_llm,
                                 goals_text=goals, profile_path=settings.profile_path, index=search_index)
 
+            from .netfix import prefer_ipv4
+
+            prefer_ipv4()  # his IPv6 route to Telegram fails about half the time; IPv4 does not
+            from .inbox import Inbox
+            from .outbox import Outbox
+            from .speech import WhisperTranscriber
+
+            transcriber = (None if settings.env.get("SB_VOICE", "on").strip().lower() == "off" else
+                           WhisperTranscriber(settings.env.get("SB_WHISPER_MODEL", "").strip() or "small",
+                                              settings.env.get("SB_WHISPER_LANG", "").strip() or None,
+                                              settings.raw_dir / "models" / "whisper"))
+
             def serve() -> None:  # a fresh Application AND event loop per attempt (run_polling closes its loop)
                 import asyncio
 
@@ -369,7 +381,9 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
                                   settings.raw_dir / "bot_state.json",
                                   focus_projects=focus, classifier=classifier,
                                   index=Index(settings.index_path, _default_embedder(settings)),
-                                  mentor=mentor).run_polling(bootstrap_retries=-1)  # keep retrying while offline
+                                  mentor=mentor, transcriber=transcriber,
+                                  inbox=Inbox(settings.raw_dir / "inbox.json"),
+                                  outbox=Outbox(settings.raw_dir / "outbox.json")).run_polling(bootstrap_retries=-1)  # keep retrying while offline
 
             code = run_with_retries(serve, settings.telegram_token)
             if code == 2:

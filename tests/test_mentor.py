@@ -205,7 +205,7 @@ def test_onboarding_runs_end_to_end_and_writes_the_profile(store, tmp_path):
         reply = m.handle_onboarding_answer(f"answer {i}", NOW + timedelta(minutes=i + 1), 100 + i)
         assert reply
     assert m.awaiting() is None and m.state.load()["done"] is True
-    assert (tmp_path / "profile" / "profile.md").read_text(encoding="utf-8").startswith("# About Daksh")
+    assert (tmp_path / "profile" / "onboarding.md").read_text(encoding="utf-8").startswith("# About Daksh")
     assert store.read_card("mo_100").key_points[1].text == "A: answer 0"
     assert m.phase(NOW + timedelta(days=1)) == 1 and m.phase(NOW + timedelta(days=12)) == 2
 
@@ -355,3 +355,16 @@ def test_facts_do_not_claim_a_history_that_does_not_exist(store):
     later = ledger.build_facts(store, NOW + timedelta(days=1))
     assert any(f.startswith("[pattern_total]") and "1" in f for f in later)
     assert any(f.startswith("[pattern_job]") and "none kept yet among the 1" in f for f in later)
+
+
+def test_mentor_never_overwrites_his_handwritten_profile_and_reads_both(store, tmp_path):
+    handwritten = tmp_path / "profile" / "profile.md"
+    handwritten.parent.mkdir(parents=True, exist_ok=True)
+    handwritten.write_text("Daksh, strong in AWS and Kubernetes.", encoding="utf-8")
+    m = make_mentor(store, tmp_path, FakeClaude())
+    m.start_onboarding(NOW)
+    for i in range(onboarding.TOTAL):
+        m.handle_onboarding_answer(f"answer {i}", NOW + timedelta(minutes=i + 1), 100 + i)
+    assert handwritten.read_text(encoding="utf-8") == "Daksh, strong in AWS and Kubernetes."  # untouched
+    text = m._profile_text()
+    assert text.startswith("Daksh, strong in AWS and Kubernetes.") and "About Daksh" in text

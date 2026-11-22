@@ -57,7 +57,7 @@ DOCUMENT_SOURCE = "document"
 PACK_CHARS = 17000
 QUESTION_CHARS = 3000
 ANSWER_STORE_CHARS = 6000
-DEFAULT_DAILY_LIMIT = 20
+DEFAULT_DAILY_LIMIT = 50
 TIMEOUT_SECONDS = 240
 
 SYSTEM_PROMPT = """You are Daksh's personal mentor and close advisor, talking to him through a private Telegram bot.

@@ -30,7 +30,7 @@ Each item becomes a private card (a small JSON file in cards/). Nothing leaves y
 Day 1 was 2026-11-19. On 2026-12-03 we count how many suggested actions you really did. If it is under about a third, we shrink or change the system.
 
 4b. Vikram, your mentor
-He starts with a few days of questions to get to know you, then every morning asks for 1-3 commitments (a time and a first action each) and every evening reviews them. He tells you what you need to hear, not what you want to hear. /ask talks to him any time (max 20 a day). Everything said is saved as cards; /private entries never reach him.
+He starts with a few days of questions to get to know you, then every morning asks for 1-3 commitments (a time and a first action each) and every evening reviews them. He tells you what you need to hear, not what you want to hear. /ask talks to him any time (max 50 a day). Everything said is saved as cards; /private entries never reach him.
 /usage shows how many Claude calls each part used.
 
 5. Commands
